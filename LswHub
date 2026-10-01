@@ -1,0 +1,2833 @@
+-- LSW GUI v9.1 (for testing in your own game)
+-- LocalScript -> StarterPlayer > StarterPlayerScripts
+-- Tabs: Scripts | Aimbot | ESP | Bot | Colors | Settings
+-- v9.1: FIX "Out of local registers ... exceeded limit 200". Luau allows max 200 locals in one function
+--     (the whole script is one function). Sections now use do ... end blocks so their helper locals
+--     go out of scope; only names that other sections need stay at the top level. No behavior change.
+-- v9: DeathFix now covers EVERYONE who dies (Killed remote for any killer, Humanoid.Died, and old
+--     characters replaced on respawn): body marked dead, that player's ESP deleted, bot/aimbot drop it.
+--     Leftover body models that appear near/with the name of a dead player are marked too, and a
+--     non-player lock whose health never changes for 4s is dropped. Auto Spawn no longer spams: when
+--     the Killed remote says YOU died it waits (default 0.5s) and presses the spawn key.
+-- v8: reload settings REMOVED, bot spams shots the whole time it is locked on, new DeathFix option
+--     (Bot tab + Aimbot tab): listens to the game's Killed remote; when YOU are the killer the victim
+--     is dropped as a target instantly and their ESP is deleted (works again after they respawn)
+-- v7: FIX bot shooting once then never again (clean press/release every shot, shot counter in the
+--     status line), FIX targeting dead bodies (NPC target is dropped the moment its Hitbox part disappears)
+-- v6: LMB firing (LMB Spam / LMB Hold / Tool Activate / Both), Auto Spawn (spams a key) + Bhop,
+--     presets that persist
+--     (executor file OR DataStore via LSW_PresetServer.lua), auto-load on start, auto-save
+
+local Players = game:GetService("Players")
+local UIS = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local PathfindingService = game:GetService("PathfindingService")
+local HttpService = game:GetService("HttpService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local lp = Players.LocalPlayer
+local playerGui = lp:WaitForChild("PlayerGui")
+local camera = Workspace.CurrentCamera
+
+for _, n in ipairs({ "LSW_GUI", "LSW_Overlay" }) do
+	local o = playerGui:FindFirstChild(n)
+	if o then o:Destroy() end
+end
+
+---------------------------------------------------------------- Config
+local Config = {
+	aimbot = {
+		enabled = false,
+		mode = "Hold RMB",
+		part = "Head",
+		fov = 150,
+		smooth = 5,
+		snap = false,
+		autoFire = false,
+		fireDelay = 0.02,
+		showFov = true,
+		teamCheck = true,
+		wallCheck = true,
+		targetNPCs = false,
+		deathFix = true, -- ignore players/bodies that the Killed remote says YOU just killed
+		fovColor = Color3.fromRGB(255, 255, 255),
+	},
+	hitbox = {
+		enabled = false,
+		size = 12,
+		part = "HumanoidRootPart",
+		transparency = 0.7,
+		teamCheck = true,
+		color = Color3.fromRGB(255, 60, 60),
+	},
+	esp = {
+		enabled = false,
+		highlight = true,
+		names = true,
+		health = true,
+		distance = true,
+		teamCheck = true,
+		wallCheck = false,
+		maxDist = 1000,
+		fill = Color3.fromRGB(235, 70, 70),
+		outline = Color3.fromRGB(255, 255, 255),
+		fillTransparency = 0.6,
+	},
+	bot = {
+		enabled = false,
+		style = "Sniper",
+		teamCheck = true,
+		deathFix = true, -- ignore players/bodies that the Killed remote says YOU just killed
+		-- NPC targeting
+		targetNPCs = true,
+		npcHitbox = "Hitbox", -- NPCs MUST have a part with this name (blank = any NPC). When that part disappears the NPC is dropped as a target.
+		npcFolder = "", -- optional: only NPCs inside this Workspace folder (blank = scan whole Workspace)
+		npcName = "", -- optional: only NPC models whose name contains this
+		usePathfinding = true,
+		wander = true,
+		autoEquip = true,
+		toolName = "",
+		maxChase = 1500,
+		wanderRadius = 40,
+		toggleKey = Enum.KeyCode.K,
+		-- firing (used by the bot AND by aimbot auto fire)
+		fireMethod = "LMB Spam", -- "LMB Spam" | "LMB Hold" | "Tool Activate" | "Both"
+		-- sniper style
+		sniperPriority = "Nearest",
+		hitPart = "Head",
+		bodyFallback = true,
+		visibleOnly = true,
+		sniperRange = 1500,
+		fireDelay = 0.01,
+		sniperMove = "Hunt",
+		-- melee style
+		attackRange = 7,
+		attackDelay = 0.2,
+	},
+	spawn = {
+		autoSpawn = false,
+		spawnKey = Enum.KeyCode.Space,
+		spawnDelay = 0.5, -- seconds to wait after the Killed remote says you died
+		spawnRetry = true, -- keep pressing (every spawnInterval, max 6x) until a new character appears
+		spawnInterval = 1,
+		bhop = false,
+		bhopHoldSpace = true,
+	},
+	snow = {
+		enabled = true,
+		amount = 45,
+		speed = 1,
+		size = 1,
+		color = Color3.fromRGB(235, 245, 255),
+	},
+	ui = {
+		accent = Color3.fromRGB(90, 120, 255), -- Primary
+		secondary = Color3.fromRGB(45, 45, 58), -- Secondary
+		secondaryTransparency = 0,
+		background = Color3.fromRGB(28, 28, 34), -- Background
+		transparency = 0, -- background transparency
+		rainbowSpeed = 0.2,
+		size = "Medium",
+		toggleKey = Enum.KeyCode.RightShift,
+		minKey = Enum.KeyCode.RightControl,
+	},
+	-- not stored inside presets (just controls the preset system itself)
+	preset = {
+		name = "default",
+		autoSave = true,
+	},
+}
+
+local SIZES = {
+	Small = UDim2.fromOffset(340, 400),
+	Medium = UDim2.fromOffset(400, 460),
+	Large = UDim2.fromOffset(480, 560),
+}
+
+local OFFGREY = Color3.fromRGB(70, 70, 80)
+local ON_COLOR = Color3.fromRGB(60, 180, 90)
+local OFF_COLOR = Color3.fromRGB(180, 60, 60)
+
+local conns = {}
+local function connect(signal, fn)
+	local c = signal:Connect(fn)
+	conns[#conns + 1] = c
+	return c
+end
+
+-- factory defaults (so "Reset All" resets to real defaults, not to the loaded preset)
+local defaultsByTbl = {}
+for _, t in pairs(Config) do
+	local copy = {}
+	for k, v in pairs(t) do copy[k] = v end
+	defaultsByTbl[t] = copy
+end
+local function defaultOf(tbl, key)
+	return defaultsByTbl[tbl][key]
+end
+
+-- forward declarations (filled in further down)
+local rainbowPickers = {}
+local slots = {}
+
+local dirty = false
+local function markDirty() dirty = true end
+
+---------------------------------------------------------------- Preset storage
+-- Where presets are kept:
+--   1) executor environments: writefile/readfile -> LSW_Presets.json
+--   2) normal game: DataStore through the LSW_Preset RemoteFunction
+--      (add LSW_PresetServer.lua to ServerScriptService)
+--   3) neither: presets only work for the current session (nothing is stored)
+local Storage = { kind = "none" }
+do
+	local FILE_NAME = "LSW_Presets.json"
+	local env = getfenv()
+	local wf, rf, isf = env.writefile, env.readfile, env.isfile
+	if typeof(wf) == "function" and typeof(rf) == "function" then
+		Storage.kind = "file"
+		function Storage.read()
+			if typeof(isf) == "function" then
+				local ok, exists = pcall(isf, FILE_NAME)
+				if ok and not exists then return nil end
+			end
+			local ok, data = pcall(rf, FILE_NAME)
+			if ok and type(data) == "string" then return data end
+			return nil
+		end
+		function Storage.write(str)
+			return (pcall(wf, FILE_NAME, str))
+		end
+	else
+		local remote = ReplicatedStorage:WaitForChild("LSW_Preset", 2)
+		if remote and remote:IsA("RemoteFunction") then
+			Storage.kind = "datastore"
+			function Storage.read()
+				local ok, res = pcall(function() return remote:InvokeServer("load") end)
+				if ok and type(res) == "string" then return res end
+				return nil
+			end
+			function Storage.write(str)
+				local ok, res = pcall(function() return remote:InvokeServer("save", str) end)
+				return ok and res == true
+			end
+		else
+			function Storage.read() return nil end
+			function Storage.write() return false end
+		end
+	end
+end
+
+-- snapshot / applySettings / writeBlob / getBlob are used by other sections; the rest stays private
+local snapshot, applySettings, writeBlob, getBlob
+do
+	local SAVE_SECTIONS = { "aimbot", "hitbox", "esp", "bot", "spawn", "snow", "ui" }
+	local SKIP = { bot = { enabled = true } } -- the bot never auto-starts after loading a preset
+
+	local function skipped(sec, key)
+		return SKIP[sec] ~= nil and SKIP[sec][key] == true
+	end
+
+	local function encodeValue(v)
+		local t = typeof(v)
+		if t == "Color3" then
+			return { c = v:ToHex() }
+		elseif t == "EnumItem" then
+			return { k = v.Name }
+		end
+		return v
+	end
+
+	-- returns nil if the saved value is unusable
+	local function decodeValue(saved, default)
+		local dt = typeof(default)
+		if dt == "Color3" then
+			if type(saved) == "table" and type(saved.c) == "string" then
+				local ok, c = pcall(Color3.fromHex, saved.c)
+				if ok and typeof(c) == "Color3" then return c end
+			end
+			return nil
+		elseif dt == "EnumItem" then
+			if type(saved) == "table" and type(saved.k) == "string" then
+				local ok, item = pcall(function() return Enum.KeyCode[saved.k] end)
+				if ok and item then return item end
+			end
+			return nil
+		elseif type(saved) == dt then
+			return saved
+		end
+		return nil
+	end
+
+	function snapshot()
+		local out = { settings = {}, rainbow = {}, scripts = {} }
+		for _, sec in ipairs(SAVE_SECTIONS) do
+			local s = {}
+			for k, v in pairs(Config[sec]) do
+				if not skipped(sec, k) then s[k] = encodeValue(v) end
+			end
+			out.settings[sec] = s
+		end
+		for i, p in ipairs(rainbowPickers) do out.rainbow[i] = p.on end
+		for _, sl in ipairs(slots) do
+			if sl.box and sl.interval then
+				out.scripts[#out.scripts + 1] = { code = sl.box.Text, interval = sl.interval.Text }
+			end
+		end
+		return out
+	end
+
+	function applySettings(settings)
+		if type(settings) ~= "table" then return end
+		for _, sec in ipairs(SAVE_SECTIONS) do
+			local s = settings[sec]
+			if type(s) == "table" then
+				for k, saved in pairs(s) do
+					local cur = Config[sec][k]
+					if cur ~= nil and not skipped(sec, k) then
+						local v = decodeValue(saved, cur)
+						if v ~= nil then Config[sec][k] = v end
+					end
+				end
+			end
+		end
+		-- old presets used RMB / "LMB Click" names; fire method is LMB Spam now
+		local fm = Config.bot.fireMethod
+		if type(fm) == "string" then
+			local migrated = (fm:gsub("RMB", "LMB"))
+			if migrated == "LMB Click" then migrated = "LMB Spam" end
+			Config.bot.fireMethod = migrated
+		end
+	end
+
+	local function readBlob()
+		local raw = Storage.read()
+		if raw and raw ~= "" then
+			local ok, data = pcall(function() return HttpService:JSONDecode(raw) end)
+			if ok and type(data) == "table" then
+				if type(data.presets) ~= "table" then data.presets = {} end
+				return data
+			end
+		end
+		return { version = 1, presets = {} }
+	end
+
+	function writeBlob(blob)
+		local ok, str = pcall(function() return HttpService:JSONEncode(blob) end)
+		if not ok then return false end
+		return Storage.write(str)
+	end
+
+	local blobCache
+	function getBlob(refresh)
+		if refresh or not blobCache then blobCache = readBlob() end
+		return blobCache
+	end
+end
+
+-- phase 1: load the startup preset's settings BEFORE the UI is built, so every control starts correct
+local startupData, startupName
+do
+	local blob = getBlob(true)
+	local name = blob.startup
+	if type(name) == "string" and type(blob.presets[name]) == "table" then
+		startupName = name
+		startupData = blob.presets[name]
+		Config.preset.name = name
+		applySettings(startupData.settings)
+	end
+end
+
+---------------------------------------------------------------- Theme system
+local accentFns = {}
+local function bindAccent(fn)
+	accentFns[#accentFns + 1] = fn
+	fn(Config.ui.accent)
+end
+
+-- kinds: "bg" (window background), "sec" (secondary), "box" (inputs: darker background)
+local surface, refreshSurfaces
+do
+	local surfaceObjs = {}
+	local function surfaceColor(kind)
+		if kind == "bg" then return Config.ui.background end
+		if kind == "sec" then return Config.ui.secondary end
+		return Config.ui.background:Lerp(Color3.new(0, 0, 0), 0.35)
+	end
+	local function applySurface(obj, kind)
+		obj.BackgroundColor3 = surfaceColor(kind)
+		if kind == "sec" then
+			obj.BackgroundTransparency = Config.ui.secondaryTransparency
+		elseif kind == "bg" then
+			obj.BackgroundTransparency = Config.ui.transparency
+		end
+	end
+	function surface(obj, kind)
+		surfaceObjs[#surfaceObjs + 1] = { obj, kind }
+		applySurface(obj, kind)
+		return obj
+	end
+	function refreshSurfaces()
+		for _, s in ipairs(surfaceObjs) do
+			applySurface(s[1], s[2])
+		end
+	end
+end
+
+local resetFns = {}
+local refreshFns = {} -- re-read every control from Config (used after loading a preset)
+
+---------------------------------------------------------------- Base UI helpers
+local function round(obj, r)
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, r or 6)
+	c.Parent = obj
+end
+
+local function makeButton(parent, text, size, pos, color)
+	local b = Instance.new("TextButton")
+	b.Text = text
+	b.Size = size
+	b.Position = pos or UDim2.new()
+	b.BackgroundColor3 = color or Config.ui.accent
+	b.TextColor3 = Color3.new(1, 1, 1)
+	b.Font = Enum.Font.GothamBold
+	b.TextSize = 13
+	b.Parent = parent
+	round(b)
+	return b
+end
+
+local function makeLabel(parent, text, size, pos)
+	local l = Instance.new("TextLabel")
+	l.BackgroundTransparency = 1
+	l.Size = size or UDim2.new(1, -20, 0, 30)
+	l.Position = pos or UDim2.new(0, 10, 0, 2)
+	l.Text = text
+	l.TextColor3 = Color3.fromRGB(235, 235, 235)
+	l.Font = Enum.Font.GothamMedium
+	l.TextSize = 13
+	l.TextXAlignment = Enum.TextXAlignment.Left
+	l.Parent = parent
+	return l
+end
+
+local function makeDraggable(handle, target, onClick)
+	local dragging, startPos, startMouse, moved
+	connect(handle.InputBegan, function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging, moved = true, false
+			startMouse = input.Position
+			startPos = target.Position
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then
+					dragging = false
+					if not moved and onClick then onClick() end
+				end
+			end)
+		end
+	end)
+	connect(UIS.InputChanged, function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+			or input.UserInputType == Enum.UserInputType.Touch) then
+			local d = input.Position - startMouse
+			if d.Magnitude > 4 then moved = true end
+			target.Position = UDim2.new(
+				startPos.X.Scale, startPos.X.Offset + d.X,
+				startPos.Y.Scale, startPos.Y.Offset + d.Y
+			)
+		end
+	end)
+end
+
+---------------------------------------------------------------- Windows
+local gui = Instance.new("ScreenGui")
+gui.Name = "LSW_GUI"
+gui.ResetOnSpawn = false
+gui.DisplayOrder = 10
+gui.Parent = playerGui
+
+local overlay = Instance.new("ScreenGui")
+overlay.Name = "LSW_Overlay"
+overlay.ResetOnSpawn = false
+overlay.IgnoreGuiInset = true
+overlay.DisplayOrder = 5
+overlay.Parent = playerGui
+
+local espFolder = Instance.new("Folder")
+espFolder.Name = "ESP"
+espFolder.Parent = overlay
+
+local main = Instance.new("Frame")
+main.Size = SIZES[Config.ui.size] or SIZES.Medium
+main.Position = UDim2.new(0.5, -200, 0.5, -230)
+main.BorderSizePixel = 0
+main.Parent = gui
+surface(main, "bg")
+round(main, 10)
+
+---------------------------------------------------------------- Snowfall
+-- Snow layer sits behind everything else in the window (ZIndex 0 vs default 1)
+local setSnowAmount, updateSnow
+do
+	local snowFrame = Instance.new("Frame")
+	snowFrame.Name = "Snow"
+	snowFrame.BackgroundTransparency = 1
+	snowFrame.Size = UDim2.new(1, 0, 1, 0)
+	snowFrame.ClipsDescendants = true
+	snowFrame.ZIndex = 0
+	snowFrame.Parent = main
+
+	local flakes = {}
+	local lastSnowColor = nil
+
+	local function snowBounds()
+		local w, h = snowFrame.AbsoluteSize.X, snowFrame.AbsoluteSize.Y
+		if w < 10 or h < 10 then
+			local s = SIZES[Config.ui.size] or SIZES.Medium
+			w, h = s.X.Offset, s.Y.Offset
+		end
+		return w, h
+	end
+
+	local function newFlake()
+		local f = Instance.new("Frame")
+		f.BorderSizePixel = 0
+		f.BackgroundColor3 = Config.snow.color
+		f.ZIndex = 0
+		local c = Instance.new("UICorner")
+		c.CornerRadius = UDim.new(1, 0)
+		c.Parent = f
+		f.Parent = snowFrame
+		local w, h = snowBounds()
+		local d = {
+			frame = f,
+			x = math.random() * w,
+			y = math.random() * h,
+			speed = math.random(25, 70),
+			size = math.random(20, 50) / 10,
+			phase = math.random() * 6.28,
+			drift = math.random(8, 22),
+		}
+		f.BackgroundTransparency = math.random(5, 45) / 100
+		flakes[#flakes + 1] = d
+	end
+
+	function setSnowAmount(n)
+		while #flakes < n do newFlake() end
+		while #flakes > n do
+			local d = table.remove(flakes)
+			d.frame:Destroy()
+		end
+	end
+
+	function updateSnow(dt)
+		local S = Config.snow
+		local visible = S.enabled and main.Visible
+		snowFrame.Visible = visible
+		if not visible then return end
+		local w, h = snowBounds()
+		local t = os.clock()
+		local recolor = (lastSnowColor ~= S.color)
+		for _, d in ipairs(flakes) do
+			d.y += d.speed * S.speed * dt
+			d.x += math.sin(t + d.phase) * d.drift * dt
+			if d.y > h + 6 then
+				d.y = -6
+				d.x = math.random() * w
+			end
+			if d.x > w + 6 then d.x = -6 elseif d.x < -6 then d.x = w + 6 end
+			local sz = d.size * S.size
+			d.frame.Size = UDim2.fromOffset(sz, sz)
+			d.frame.Position = UDim2.fromOffset(d.x, d.y)
+			if recolor then d.frame.BackgroundColor3 = S.color end
+		end
+		lastSnowColor = S.color
+	end
+
+	setSnowAmount(Config.snow.amount)
+end
+
+local minimize, restore, closeBtn
+do
+	local titleBar = Instance.new("Frame")
+	titleBar.Size = UDim2.new(1, 0, 0, 34)
+	titleBar.BorderSizePixel = 0
+	titleBar.Parent = main
+	surface(titleBar, "sec")
+	round(titleBar, 10)
+
+	local title = makeLabel(titleBar, "LSW Panel", UDim2.new(1, -90, 1, 0), UDim2.new(0, 12, 0, 0))
+	title.Font = Enum.Font.GothamBold
+	title.TextSize = 15
+
+	local minBtn = makeButton(titleBar, "-", UDim2.fromOffset(28, 24), UDim2.new(1, -66, 0, 5), Color3.fromRGB(200, 160, 50))
+	closeBtn = makeButton(titleBar, "X", UDim2.fromOffset(28, 24), UDim2.new(1, -34, 0, 5), OFF_COLOR)
+
+	local block = Instance.new("TextButton")
+	block.Size = UDim2.fromOffset(56, 56)
+	block.Text = "LSW"
+	block.TextColor3 = Color3.new(1, 1, 1)
+	block.Font = Enum.Font.GothamBlack
+	block.TextSize = 18
+	block.AutoButtonColor = false
+	block.Visible = false
+	block.Parent = gui
+	round(block, 10)
+	bindAccent(function(c) block.BackgroundColor3 = c end)
+
+	function minimize()
+		block.Position = main.Position
+		main.Visible = false
+		block.Visible = true
+	end
+	function restore()
+		main.Position = block.Position
+		block.Visible = false
+		main.Visible = true
+	end
+	minBtn.MouseButton1Click:Connect(minimize)
+	makeDraggable(titleBar, main)
+	makeDraggable(block, block, restore)
+end
+
+---------------------------------------------------------------- Tabs
+local tabs = {}
+local selectTab, themeChanged
+do
+	local tabNames = { "Scripts", "Aimbot", "ESP", "Bot", "Colors", "Settings" }
+	local currentTab = nil
+
+	local tabBar = Instance.new("Frame")
+	tabBar.Size = UDim2.new(1, -20, 0, 28)
+	tabBar.Position = UDim2.new(0, 10, 0, 40)
+	tabBar.BackgroundTransparency = 1
+	tabBar.Parent = main
+
+	function selectTab(name)
+		for n, t in pairs(tabs) do
+			t.page.Visible = (n == name)
+			if n == name then
+				t.btn.BackgroundColor3 = Config.ui.accent
+				t.btn.BackgroundTransparency = 0
+			else
+				t.btn.BackgroundColor3 = Config.ui.secondary
+				t.btn.BackgroundTransparency = Config.ui.secondaryTransparency
+			end
+		end
+		currentTab = name
+	end
+
+	function themeChanged()
+		refreshSurfaces()
+		for _, f in ipairs(accentFns) do f(Config.ui.accent) end
+		if currentTab then selectTab(currentTab) end
+	end
+
+	for i, name in ipairs(tabNames) do
+		local btn = makeButton(tabBar, name, UDim2.new(1 / #tabNames, -4, 1, 0),
+			UDim2.new((i - 1) / #tabNames, 0, 0, 0))
+		btn.TextScaled = true
+		local limit = Instance.new("UITextSizeConstraint")
+		limit.MaxTextSize = 13
+		limit.Parent = btn
+
+		local page = Instance.new("ScrollingFrame")
+		page.Size = UDim2.new(1, -20, 1, -80)
+		page.Position = UDim2.new(0, 10, 0, 74)
+		page.BackgroundTransparency = 1
+		page.BorderSizePixel = 0
+		page.ScrollBarThickness = 5
+		page.CanvasSize = UDim2.new()
+		page.AutomaticCanvasSize = Enum.AutomaticSize.Y
+		page.Visible = false
+		page.Parent = main
+
+		local l = Instance.new("UIListLayout")
+		l.Padding = UDim.new(0, 6)
+		l.SortOrder = Enum.SortOrder.LayoutOrder
+		l.Parent = page
+
+		tabs[name] = { page = page, btn = btn }
+		btn.MouseButton1Click:Connect(function() selectTab(name) end)
+	end
+end
+
+---------------------------------------------------------------- Controls
+local orderCounter = 0
+local groupObjs = {} -- {guiObject, groupName} so a page can show/hide sections (Bot sub tabs)
+local currentGroup = nil
+local function row(page, h, noSurface)
+	orderCounter += 1
+	local f = Instance.new("Frame")
+	f.Size = UDim2.new(1, -8, 0, h or 34)
+	f.BorderSizePixel = 0
+	f.LayoutOrder = orderCounter
+	f.Parent = page
+	if currentGroup then groupObjs[#groupObjs + 1] = { f, currentGroup } end
+	if noSurface then
+		f.BackgroundTransparency = 1
+	else
+		surface(f, "sec")
+		round(f, 6)
+	end
+	return f
+end
+
+local function header(page, text)
+	orderCounter += 1
+	local l = makeLabel(page, text, UDim2.new(1, -8, 0, 24))
+	l.Font = Enum.Font.GothamBold
+	l.TextSize = 14
+	l.LayoutOrder = orderCounter
+	if currentGroup then groupObjs[#groupObjs + 1] = { l, currentGroup } end
+	bindAccent(function(c) l.TextColor3 = c end)
+end
+
+-- returns a setter so other code (keybinds) can flip it
+local function toggle(page, text, tbl, key, onChange)
+	local f = row(page)
+	makeLabel(f, text, UDim2.new(1, -70, 1, 0), UDim2.new(0, 10, 0, 0))
+	local sw = Instance.new("TextButton")
+	sw.Text = ""
+	sw.Size = UDim2.fromOffset(44, 22)
+	sw.Position = UDim2.new(1, -54, 0.5, -11)
+	sw.Parent = f
+	round(sw, 11)
+	local knob = Instance.new("Frame")
+	knob.Size = UDim2.fromOffset(18, 18)
+	knob.BackgroundColor3 = Color3.new(1, 1, 1)
+	knob.Parent = sw
+	round(knob, 9)
+
+	local default = defaultOf(tbl, key)
+	local function refresh()
+		local on = tbl[key]
+		sw.BackgroundColor3 = on and Config.ui.accent or OFFGREY
+		knob.Position = on and UDim2.new(1, -20, 0, 2) or UDim2.new(0, 2, 0, 2)
+	end
+	bindAccent(refresh)
+	refreshFns[#refreshFns + 1] = refresh
+	local function set(v)
+		tbl[key] = v
+		refresh()
+		markDirty()
+		if onChange then onChange(v) end
+	end
+	sw.MouseButton1Click:Connect(function() set(not tbl[key]) end)
+	resetFns[#resetFns + 1] = function() set(default) end
+	return set
+end
+
+local function slider(page, text, tbl, key, min, max, step, onChange)
+	local f = row(page, 50)
+	local lbl = makeLabel(f, "", UDim2.new(1, -20, 0, 24))
+	local hit = Instance.new("TextButton")
+	hit.Text = ""
+	hit.BackgroundTransparency = 1
+	hit.Size = UDim2.new(1, -20, 0, 22)
+	hit.Position = UDim2.new(0, 10, 0, 26)
+	hit.Parent = f
+	local bar = Instance.new("Frame")
+	bar.Size = UDim2.new(1, 0, 0, 6)
+	bar.Position = UDim2.new(0, 0, 0.5, -3)
+	bar.BorderSizePixel = 0
+	bar.Parent = hit
+	surface(bar, "box")
+	round(bar, 3)
+	local fill = Instance.new("Frame")
+	fill.BorderSizePixel = 0
+	fill.Parent = bar
+	round(fill, 3)
+	bindAccent(function(c) fill.BackgroundColor3 = c end)
+
+	local function set(v, fire)
+		v = math.clamp(math.floor(v / step + 0.5) * step, min, max)
+		tbl[key] = v
+		fill.Size = UDim2.new((v - min) / (max - min), 0, 1, 0)
+		lbl.Text = text .. ": " .. tostring(math.floor(v * 100 + 0.5) / 100)
+		if fire then
+			markDirty()
+			if onChange then onChange(v) end
+		end
+	end
+	local default = defaultOf(tbl, key)
+	set(tbl[key], false)
+	refreshFns[#refreshFns + 1] = function() set(tbl[key], false) end
+
+	local dragging = false
+	local function fromX(x)
+		local rel = math.clamp((x - bar.AbsolutePosition.X) / bar.AbsoluteSize.X, 0, 1)
+		set(min + (max - min) * rel, true)
+	end
+	hit.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			fromX(input.Position.X)
+		end
+	end)
+	connect(UIS.InputChanged, function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+			or input.UserInputType == Enum.UserInputType.Touch) then
+			fromX(input.Position.X)
+		end
+	end)
+	connect(UIS.InputEnded, function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end)
+	resetFns[#resetFns + 1] = function() set(default, true) end
+end
+
+local function cycle(page, text, tbl, key, options, onChange)
+	local f = row(page)
+	makeLabel(f, text, UDim2.new(1, -170, 1, 0), UDim2.new(0, 10, 0, 0))
+	local btn = makeButton(f, tostring(tbl[key]), UDim2.fromOffset(150, 24), UDim2.new(1, -160, 0.5, -12))
+	btn.TextScaled = true
+	local limit = Instance.new("UITextSizeConstraint")
+	limit.MaxTextSize = 13
+	limit.Parent = btn
+	surface(btn, "box")
+	local default = defaultOf(tbl, key)
+	btn.MouseButton1Click:Connect(function()
+		local idx = table.find(options, tbl[key]) or 0
+		tbl[key] = options[(idx % #options) + 1]
+		btn.Text = tbl[key]
+		markDirty()
+		if onChange then onChange(tbl[key]) end
+	end)
+	refreshFns[#refreshFns + 1] = function() btn.Text = tostring(tbl[key]) end
+	resetFns[#resetFns + 1] = function()
+		tbl[key] = default
+		btn.Text = default
+		markDirty()
+		if onChange then onChange(default) end
+	end
+end
+
+local function textInput(page, text, tbl, key, placeholder)
+	local f = row(page)
+	makeLabel(f, text, UDim2.new(1, -150, 1, 0), UDim2.new(0, 10, 0, 0))
+	local box = Instance.new("TextBox")
+	box.Size = UDim2.fromOffset(130, 24)
+	box.Position = UDim2.new(1, -140, 0.5, -12)
+	box.TextColor3 = Color3.new(1, 1, 1)
+	box.PlaceholderText = placeholder or ""
+	box.PlaceholderColor3 = Color3.fromRGB(120, 120, 120)
+	box.Font = Enum.Font.Code
+	box.TextSize = 12
+	box.ClearTextOnFocus = false
+	box.Text = tbl[key]
+	box.Parent = f
+	surface(box, "box")
+	round(box, 5)
+	local default = defaultOf(tbl, key)
+	box.FocusLost:Connect(function()
+		tbl[key] = box.Text
+		markDirty()
+	end)
+	refreshFns[#refreshFns + 1] = function() box.Text = tbl[key] end
+	resetFns[#resetFns + 1] = function()
+		tbl[key] = default
+		box.Text = default
+		markDirty()
+	end
+end
+
+local listening -- keybind currently waiting for a key
+local function keybind(page, text, tbl, key)
+	local f = row(page)
+	makeLabel(f, text, UDim2.new(1, -150, 1, 0), UDim2.new(0, 10, 0, 0))
+	local btn = makeButton(f, tbl[key].Name, UDim2.fromOffset(130, 24), UDim2.new(1, -140, 0.5, -12))
+	surface(btn, "box")
+	local default = defaultOf(tbl, key)
+	btn.MouseButton1Click:Connect(function()
+		btn.Text = "press a key..."
+		listening = function(kc)
+			if kc ~= Enum.KeyCode.Escape then
+				tbl[key] = kc
+				markDirty()
+			end
+			btn.Text = tbl[key].Name
+		end
+	end)
+	refreshFns[#refreshFns + 1] = function() btn.Text = tbl[key].Name end
+	resetFns[#resetFns + 1] = function()
+		tbl[key] = default
+		btn.Text = default.Name
+		markDirty()
+	end
+end
+
+-- One-slider color picker: white -> full rainbow -> black, plus hex box and a per-color Rainbow mode
+local colorPick
+do
+	local WHITE_END, BLACK_START = 0.07, 0.93
+
+	local function colorAt(t)
+		t = math.clamp(t, 0, 1)
+		if t < WHITE_END then
+			return Color3.new(1, 1, 1):Lerp(Color3.fromHSV(0, 1, 1), t / WHITE_END)
+		elseif t > BLACK_START then
+			return Color3.fromHSV(0.92, 1, 1):Lerp(Color3.new(0, 0, 0), (t - BLACK_START) / (1 - BLACK_START))
+		end
+		return Color3.fromHSV((t - WHITE_END) / (BLACK_START - WHITE_END) * 0.92, 1, 1)
+	end
+
+	local SLIDER_SEQ
+	do
+		local kp = { ColorSequenceKeypoint.new(0, colorAt(0)) }
+		for i = 0, 14 do
+			local t = WHITE_END + (BLACK_START - WHITE_END) * (i / 14)
+			kp[#kp + 1] = ColorSequenceKeypoint.new(math.min(t, 0.999), colorAt(t))
+		end
+		kp[#kp + 1] = ColorSequenceKeypoint.new(1, colorAt(1))
+		SLIDER_SEQ = ColorSequence.new(kp)
+	end
+
+	local function posForColor(c)
+		local best, bestD = 0, math.huge
+		for i = 0, 240 do
+			local t = i / 240
+			local cc = colorAt(t)
+			local d = (cc.R - c.R) ^ 2 + (cc.G - c.G) ^ 2 + (cc.B - c.B) ^ 2
+			if d < bestD then best, bestD = t, d end
+		end
+		return best
+	end
+
+	local rainbowCounter = 0
+
+	function colorPick(page, text, tbl, key, onChange)
+		local f = row(page, 98)
+		local lbl = makeLabel(f, "", UDim2.new(1, -70, 0, 26))
+		local preview = Instance.new("Frame")
+		preview.Size = UDim2.fromOffset(46, 18)
+		preview.Position = UDim2.new(1, -56, 0, 6)
+		preview.BorderSizePixel = 0
+		preview.Parent = f
+		round(preview, 4)
+
+		local hit = Instance.new("TextButton")
+		hit.Text = ""
+		hit.BackgroundTransparency = 1
+		hit.Size = UDim2.new(1, -20, 0, 28)
+		hit.Position = UDim2.new(0, 10, 0, 28)
+		hit.Parent = f
+
+		local bar = Instance.new("Frame")
+		bar.Size = UDim2.new(1, 0, 0, 12)
+		bar.Position = UDim2.new(0, 0, 0.5, -6)
+		bar.BackgroundColor3 = Color3.new(1, 1, 1)
+		bar.BorderSizePixel = 0
+		bar.Parent = hit
+		round(bar, 6)
+		local grad = Instance.new("UIGradient")
+		grad.Color = SLIDER_SEQ
+		grad.Parent = bar
+
+		local marker = Instance.new("Frame")
+		marker.Size = UDim2.fromOffset(4, 22)
+		marker.BackgroundColor3 = Color3.new(1, 1, 1)
+		marker.BorderSizePixel = 0
+		marker.ZIndex = 2
+		marker.Parent = hit
+		local stroke = Instance.new("UIStroke")
+		stroke.Color = Color3.new(0, 0, 0)
+		stroke.Thickness = 1
+		stroke.Parent = marker
+
+		local hexBox = Instance.new("TextBox")
+		hexBox.Size = UDim2.fromOffset(90, 26)
+		hexBox.Position = UDim2.new(0, 10, 0, 64)
+		hexBox.TextColor3 = Color3.new(1, 1, 1)
+		hexBox.Font = Enum.Font.Code
+		hexBox.TextSize = 13
+		hexBox.ClearTextOnFocus = false
+		hexBox.PlaceholderText = "HEX"
+		hexBox.Text = ""
+		hexBox.Parent = f
+		surface(hexBox, "box")
+		round(hexBox, 5)
+
+		local rbBtn = makeButton(f, "Rainbow: OFF", UDim2.fromOffset(120, 26), UDim2.new(1, -130, 0, 64), OFFGREY)
+
+		local default = defaultOf(tbl, key)
+		local p = { on = false, offset = (rainbowCounter * 0.11) % 1 }
+		rainbowCounter += 1
+		local pos = posForColor(tbl[key])
+
+		local function refresh()
+			local c = tbl[key]
+			preview.BackgroundColor3 = c
+			lbl.Text = text .. "  #" .. c:ToHex():upper()
+			if not hexBox:IsFocused() then hexBox.Text = c:ToHex():upper() end
+			marker.Position = UDim2.new(pos, -2, 0.5, -11)
+			marker.Visible = not p.on
+			rbBtn.Text = p.on and "Rainbow: ON" or "Rainbow: OFF"
+			rbBtn.BackgroundColor3 = p.on and ON_COLOR or OFFGREY
+		end
+		local function commit(fire)
+			refresh()
+			if fire and onChange then onChange(tbl[key]) end
+		end
+
+		function p.apply(c)
+			tbl[key] = c
+			commit(true)
+		end
+		function p.setOn(v)
+			p.on = v
+			if not v then pos = posForColor(tbl[key]) end
+			markDirty()
+			commit(false)
+		end
+		rainbowPickers[#rainbowPickers + 1] = p
+
+		refreshFns[#refreshFns + 1] = function()
+			pos = posForColor(tbl[key])
+			refresh()
+		end
+
+		local dragging = false
+		local function fromX(x)
+			if p.on then return end
+			pos = math.clamp((x - hit.AbsolutePosition.X) / hit.AbsoluteSize.X, 0, 1)
+			tbl[key] = colorAt(pos)
+			markDirty()
+			commit(true)
+		end
+		hit.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1
+				or input.UserInputType == Enum.UserInputType.Touch then
+				dragging = true
+				fromX(input.Position.X)
+			end
+		end)
+		connect(UIS.InputChanged, function(input)
+			if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+				or input.UserInputType == Enum.UserInputType.Touch) then
+				fromX(input.Position.X)
+			end
+		end)
+		connect(UIS.InputEnded, function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1
+				or input.UserInputType == Enum.UserInputType.Touch then
+				dragging = false
+			end
+		end)
+
+		hexBox.FocusLost:Connect(function()
+			local s = string.gsub(hexBox.Text, "#", "")
+			local ok, c = pcall(Color3.fromHex, s)
+			if ok and typeof(c) == "Color3" then
+				p.on = false
+				tbl[key] = c
+				pos = posForColor(c)
+				markDirty()
+				commit(true)
+			else
+				commit(false)
+			end
+		end)
+
+		rbBtn.MouseButton1Click:Connect(function()
+			p.setOn(not p.on)
+		end)
+
+		resetFns[#resetFns + 1] = function()
+			p.on = false
+			tbl[key] = default
+			pos = posForColor(default)
+			markDirty()
+			commit(true)
+		end
+
+		refresh()
+	end
+end
+
+local function updateRainbow()
+	local base = os.clock() * Config.ui.rainbowSpeed
+	for _, p in ipairs(rainbowPickers) do
+		if p.on then p.apply(Color3.fromHSV((base + p.offset) % 1, 1, 1)) end
+	end
+end
+
+local function actionButton(page, text, color, fn)
+	local f = row(page, 34, true)
+	local b = makeButton(f, text, UDim2.new(1, 0, 1, 0), nil, color)
+	b.MouseButton1Click:Connect(fn)
+	return b
+end
+
+---------------------------------------------------------------- Scripts tab
+local addSlot, clearSlots, stopAllLoops
+do
+	local scriptsPage = tabs.Scripts.page
+	local slotCount = 0
+
+	local FRAME_H = { normal = 172, expanded = 320 }
+	local BOX_MIN_H = { normal = 100, expanded = 248 }
+
+	local function runCode(code)
+		local fn, err = loadstring(code)
+		if not fn then
+			warn("[LSW] Syntax error: " .. tostring(err))
+			return
+		end
+		local ok, runErr = pcall(fn)
+		if not ok then warn("[LSW] Runtime error: " .. tostring(runErr)) end
+	end
+
+	function addSlot(defaultCode, defaultInterval)
+		slotCount += 1
+		orderCounter += 1
+		local slot = { looping = false }
+		slots[#slots + 1] = slot
+
+		local frame = Instance.new("Frame")
+		frame.Size = UDim2.new(1, -8, 0, FRAME_H.normal)
+		frame.BorderSizePixel = 0
+		frame.LayoutOrder = orderCounter
+		frame.Parent = scriptsPage
+		surface(frame, "sec")
+		round(frame, 8)
+		slot.frame = frame
+
+		local nameLbl = makeLabel(frame, "Script " .. slotCount, UDim2.new(1, -110, 0, 22), UDim2.new(0, 8, 0, 4))
+		nameLbl.Font = Enum.Font.GothamBold
+
+		local del = makeButton(frame, "X", UDim2.fromOffset(24, 20), UDim2.new(1, -30, 0, 5), OFF_COLOR)
+		local expandBtn = makeButton(frame, "Expand", UDim2.fromOffset(58, 20), UDim2.new(1, -94, 0, 5))
+		expandBtn.TextSize = 11
+		surface(expandBtn, "box")
+
+		local codeScroll = Instance.new("ScrollingFrame")
+		codeScroll.Size = UDim2.new(1, -16, 1, -72)
+		codeScroll.Position = UDim2.new(0, 8, 0, 28)
+		codeScroll.BorderSizePixel = 0
+		codeScroll.ScrollBarThickness = 6
+		codeScroll.ScrollingDirection = Enum.ScrollingDirection.Y
+		codeScroll.CanvasSize = UDim2.new()
+		codeScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+		codeScroll.Parent = frame
+		surface(codeScroll, "box")
+		round(codeScroll, 6)
+
+		local box = Instance.new("TextBox")
+		box.Size = UDim2.new(1, -8, 0, BOX_MIN_H.normal)
+		box.AutomaticSize = Enum.AutomaticSize.Y
+		box.BackgroundTransparency = 1
+		box.TextColor3 = Color3.fromRGB(220, 220, 220)
+		box.PlaceholderText = "-- paste your script here"
+		box.PlaceholderColor3 = Color3.fromRGB(120, 120, 120)
+		box.Text = defaultCode or ""
+		box.ClearTextOnFocus = false
+		box.MultiLine = true
+		box.TextWrapped = true
+		box.TextXAlignment = Enum.TextXAlignment.Left
+		box.TextYAlignment = Enum.TextYAlignment.Top
+		box.Font = Enum.Font.Code
+		box.TextSize = 13
+		box.Parent = codeScroll
+		slot.box = box
+
+		local pad = Instance.new("UIPadding")
+		pad.PaddingLeft = UDim.new(0, 4)
+		pad.PaddingTop = UDim.new(0, 3)
+		pad.PaddingBottom = UDim.new(0, 3)
+		pad.Parent = box
+
+		local expanded = false
+		expandBtn.MouseButton1Click:Connect(function()
+			expanded = not expanded
+			local k = expanded and "expanded" or "normal"
+			frame.Size = UDim2.new(1, -8, 0, FRAME_H[k])
+			box.Size = UDim2.new(1, -8, 0, BOX_MIN_H[k])
+			expandBtn.Text = expanded and "Shrink" or "Expand"
+		end)
+
+		local run = makeButton(frame, "Run", UDim2.fromOffset(70, 30), UDim2.new(0, 8, 1, -38))
+		bindAccent(function(c) run.BackgroundColor3 = c end)
+
+		local loopBtn = makeButton(frame, "Loop: OFF", UDim2.fromOffset(96, 30), UDim2.new(0, 84, 1, -38), OFF_COLOR)
+
+		makeLabel(frame, "Every(s)", UDim2.fromOffset(50, 30), UDim2.new(0, 186, 1, -38)).TextSize = 11
+
+		local interval = Instance.new("TextBox")
+		interval.Size = UDim2.fromOffset(60, 30)
+		interval.Position = UDim2.new(0, 238, 1, -38)
+		interval.TextColor3 = Color3.new(1, 1, 1)
+		interval.Text = defaultInterval or "1"
+		interval.Font = Enum.Font.Code
+		interval.TextSize = 13
+		interval.Parent = frame
+		surface(interval, "box")
+		round(interval, 6)
+		slot.interval = interval
+
+		-- connected after the initial text is set so creating/loading a slot doesn't count as an edit
+		box:GetPropertyChangedSignal("Text"):Connect(markDirty)
+		interval:GetPropertyChangedSignal("Text"):Connect(markDirty)
+
+		run.MouseButton1Click:Connect(function() task.spawn(runCode, box.Text) end)
+
+		function slot.setLoop(state)
+			slot.looping = state
+			loopBtn.Text = state and "Loop: ON" or "Loop: OFF"
+			loopBtn.BackgroundColor3 = state and ON_COLOR or OFF_COLOR
+			if state then
+				task.spawn(function()
+					while slot.looping do
+						runCode(box.Text)
+						task.wait(math.max(tonumber(interval.Text) or 1, 0.05))
+					end
+				end)
+			end
+		end
+		loopBtn.MouseButton1Click:Connect(function() slot.setLoop(not slot.looping) end)
+		del.MouseButton1Click:Connect(function()
+			slot.looping = false
+			local i = table.find(slots, slot)
+			if i then table.remove(slots, i) end
+			frame:Destroy()
+			markDirty()
+		end)
+	end
+
+	function clearSlots()
+		for _, s in ipairs(slots) do
+			s.looping = false
+			if s.frame then s.frame:Destroy() end
+		end
+		table.clear(slots)
+		slotCount = 0
+	end
+
+	local addRow = row(scriptsPage, 30, true)
+	addRow.LayoutOrder = 0
+	local addBtn = makeButton(addRow, "+ Add Script", UDim2.new(1, 0, 1, 0))
+	bindAccent(function(c) addBtn.BackgroundColor3 = c end)
+	addBtn.MouseButton1Click:Connect(function()
+		addSlot()
+		markDirty()
+	end)
+	addSlot('print("Hello from LSW!")')
+
+	function stopAllLoops()
+		for _, s in ipairs(slots) do
+			if s.setLoop and s.looping then s.setLoop(false) end
+		end
+	end
+end
+
+---------------------------------------------------------------- Shared checks / helpers
+local function isEnemy(plr)
+	if plr == lp then return false end
+	if lp.Team ~= nil and plr.Team == lp.Team then return false end
+	return true
+end
+
+-- true if nothing solid sits between origin (default: camera) and the part
+local isVisible
+do
+	local rayParams = RaycastParams.new()
+	rayParams.FilterType = Enum.RaycastFilterType.Exclude
+	rayParams.RespectCanCollide = true -- ignore non-collidable parts (triggers etc.)
+
+	function isVisible(part, character, origin)
+		origin = origin or camera.CFrame.Position
+		rayParams.FilterDescendantsInstances = { lp.Character }
+		local result = Workspace:Raycast(origin, part.Position - origin, rayParams)
+		if not result then return true end
+		return result.Instance:IsDescendantOf(character)
+	end
+end
+
+local function getAlive(plr)
+	local char = plr.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if hum and hum.Health > 0 then return char, hum end
+end
+
+local function pickPart(char, name)
+	return char:FindFirstChild(name)
+		or (name == "UpperTorso" and char:FindFirstChild("Torso"))
+		or char:FindFirstChild("HumanoidRootPart")
+end
+
+-- Rotates the camera so whatever is under the mouse cursor (screen center if mouse-locked)
+-- ends up pointing exactly at pos. Instant, no smoothing.
+local function snapCameraTo(pos)
+	local cf = camera.CFrame
+	local mouse = UIS:GetMouseLocation()
+	local a = camera:ViewportPointToRay(mouse.X, mouse.Y).Direction.Unit
+	local b = (pos - cf.Position).Unit
+	local axis = a:Cross(b)
+	if axis.Magnitude < 1e-5 then return end
+	local angle = math.acos(math.clamp(a:Dot(b), -1, 1))
+	local rot = CFrame.fromAxisAngle(axis.Unit, angle)
+	camera.CFrame = CFrame.new(cf.Position) * (rot * cf.Rotation)
+end
+
+local function faceFlat(root, pos)
+	local flat = Vector3.new(pos.X - root.Position.X, 0, pos.Z - root.Position.Z)
+	if flat.Magnitude > 0.1 then
+		root.CFrame = CFrame.lookAt(root.Position, root.Position + flat)
+	end
+end
+
+---------------------------------------------------------------- NPC / target helpers
+-- A "target" is { char = Model, hum = Humanoid or nil, name = string, plr = Player or nil,
+--                 hbPart = the NPC's Hitbox part or nil }.
+-- Players come from Players:GetPlayers(); NPCs are found by scanning Workspace twice a second.
+--
+-- Dead-body rule: if "NPC Hitbox Part Name" is set, an NPC only counts while it HAS that part, and
+-- it stops counting the instant that part is removed/unparented (checked every frame, not just on
+-- the scan). Leave the name blank to target any NPC model regardless of parts.
+local npcList = {}
+
+-- DeathFix: characters/bodies the game's Killed remote said YOU killed. Keyed by the Model, so a
+-- respawned player (new Character model) is automatically a valid target again. Weak keys: entries
+-- vanish on their own once the body is destroyed.
+local deadChars = setmetatable({}, { __mode = "k" })
+
+local function markDead(model)
+	local r = model:FindFirstChild("HumanoidRootPart")
+	deadChars[model] = { pos = r and r.Position or nil }
+end
+
+local function isDeadMarked(char)
+	local m = deadChars[char]
+	if not m then return false end
+	if m.pos then
+		local r = char:FindFirstChild("HumanoidRootPart")
+		if r and (r.Position - m.pos).Magnitude > 60 then
+			-- the same model teleported far away = it respawned (some games reuse the model)
+			deadChars[char] = nil
+			return false
+		end
+	end
+	return true
+end
+
+-- bodies: deaths we saw recently, and when each NPC-looking model first appeared
+local recentDeaths = {} -- { t = time, pos = Vector3 or nil, names = { [name] = true } }
+local checkNewBodies
+do
+	local npcFirstSeen = setmetatable({}, { __mode = "k" })
+
+	-- a non-player model counts as a leftover body when, within 10s of someone dying, it either carries
+	-- that player's name, or it appeared around the time of the death within 25 studs of where it happened
+	function checkNewBodies()
+		local now = os.clock()
+		for i = #recentDeaths, 1, -1 do
+			if now - recentDeaths[i].t > 10 then table.remove(recentDeaths, i) end
+		end
+		if #recentDeaths == 0 then return end
+		for _, e in ipairs(npcList) do
+			if not e.plr and not deadChars[e.char] then
+				local seen = npcFirstSeen[e.char] or now
+				local root = e.hbPart or e.char:FindFirstChild("HumanoidRootPart") or e.char.PrimaryPart
+				for _, d in ipairs(recentDeaths) do
+					local nameHit = d.names[e.name] == true
+					local posHit = root ~= nil and d.pos ~= nil
+						and (root.Position - d.pos).Magnitude < 25 and seen >= d.t - 3
+					if nameHit or posHit then
+						markDead(e.char)
+						break
+					end
+				end
+			end
+		end
+	end
+
+	local function findNpcHitbox(model)
+		local hb = Config.bot.npcHitbox
+		if not hb or hb == "" then return nil end
+		local p = model:FindFirstChild(hb, true)
+		if p and p:IsA("BasePart") then return p end
+		return nil
+	end
+
+	local function scanNpcs()
+		table.clear(npcList)
+		local BN = Config.bot
+		local skip = {}
+		for _, plr in ipairs(Players:GetPlayers()) do
+			if plr.Character then skip[plr.Character] = true end
+		end
+		local nameFilter = string.lower(BN.npcName or "")
+		local function nameOk(m)
+			return nameFilter == "" or string.find(string.lower(m.Name), nameFilter, 1, true) ~= nil
+		end
+		local needHb = (BN.npcHitbox or "") ~= ""
+		local function addNpc(m, hum)
+			local hbPart = findNpcHitbox(m)
+			if needHb and not hbPart then return end -- no hitbox = dead body / not a real target
+			if not npcFirstSeen[m] then npcFirstSeen[m] = os.clock() end
+			npcList[#npcList + 1] = { char = m, hum = hum, name = m.Name, hbPart = hbPart }
+		end
+
+		local folderName = BN.npcFolder or ""
+		if folderName ~= "" then
+			-- folder mode: every Model inside the folder counts (a Humanoid isn't required)
+			local folder = Workspace:FindFirstChild(folderName, true)
+			if not folder then return end
+			local counted = {}
+			for _, d in ipairs(folder:GetDescendants()) do
+				if d:IsA("Model") and not skip[d] and nameOk(d) then
+					local nested = false
+					local a = d.Parent
+					while a and a ~= folder do
+						if counted[a] then nested = true break end
+						a = a.Parent
+					end
+					if not nested and d:FindFirstChildWhichIsA("BasePart", true) then
+						counted[d] = true
+						addNpc(d, d:FindFirstChildOfClass("Humanoid"))
+					end
+				end
+			end
+		else
+			-- whole-Workspace mode: every Model with a living Humanoid that isn't a player
+			for _, d in ipairs(Workspace:GetDescendants()) do
+				if d:IsA("Humanoid") then
+					local m = d.Parent
+					if m and m:IsA("Model") and not skip[m] and d.Health > 0 and nameOk(m) then
+						addNpc(m, d)
+					end
+				end
+			end
+		end
+	end
+
+	local lastNpcScan = 0
+	connect(RunService.Heartbeat, function()
+		local now = os.clock()
+		if now - lastNpcScan < 0.5 then return end
+		lastNpcScan = now
+		if Config.bot.targetNPCs or Config.aimbot.targetNPCs then
+			scanNpcs()
+			checkNewBodies()
+		elseif #npcList > 0 then
+			table.clear(npcList)
+		end
+	end)
+end
+
+local function entityAlive(e, deathFix)
+	if not e.char or not e.char:IsDescendantOf(Workspace) then return false end
+	if deathFix and isDeadMarked(e.char) then return false end
+	if e.hum and e.hum.Health <= 0 then return false end
+	if e.hbPart then
+		-- the hitbox part vanished -> the NPC is dead: drop it immediately
+		if not e.hbPart.Parent or not e.hbPart:IsDescendantOf(Workspace) then return false end
+	end
+	return true
+end
+
+local function entityRoot(e)
+	return e.char:FindFirstChild("HumanoidRootPart")
+		or e.char.PrimaryPart
+		or (e.hbPart and e.hbPart.Parent and e.hbPart)
+		or e.char:FindFirstChildWhichIsA("BasePart", true)
+end
+
+-- the part to aim at
+local function entityPart(e, preferred)
+	if e.plr then return pickPart(e.char, preferred) end
+	if e.hbPart and e.hbPart.Parent then return e.hbPart end
+	return pickPart(e.char, preferred) or entityRoot(e)
+end
+
+-- every valid target right now (players, plus NPCs if includeNpcs).
+-- deathFix = skip anything the Killed remote marked as dead.
+local function collectTargets(teamCheck, includeNpcs, deathFix)
+	local list = {}
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= lp and (not teamCheck or isEnemy(plr)) then
+			local char, hum = getAlive(plr)
+			if char and not (deathFix and isDeadMarked(char)) then
+				list[#list + 1] = { char = char, hum = hum, name = plr.DisplayName, plr = plr }
+			end
+		end
+	end
+	if includeNpcs then
+		for _, e in ipairs(npcList) do
+			if entityAlive(e, deathFix) then list[#list + 1] = e end
+		end
+	end
+	return list
+end
+
+---------------------------------------------------------------- Hitbox expander (client-side)
+local hbRestoreAll
+do
+	local hbOriginal = {} -- part -> original properties
+
+	local function hbRestore(part)
+		local o = hbOriginal[part]
+		if not o then return end
+		if part.Parent then
+			part.Size = o.Size
+			part.Transparency = o.Transparency
+			part.Color = o.Color
+			part.CanCollide = o.CanCollide
+			part.Massless = o.Massless
+		end
+		hbOriginal[part] = nil
+	end
+
+	function hbRestoreAll()
+		for part in pairs(hbOriginal) do hbRestore(part) end
+	end
+
+	local function hbApply(part)
+		local H = Config.hitbox
+		if not hbOriginal[part] then
+			hbOriginal[part] = {
+				Size = part.Size,
+				Transparency = part.Transparency,
+				Color = part.Color,
+				CanCollide = part.CanCollide,
+				Massless = part.Massless,
+			}
+		end
+		local s = Vector3.new(H.size, H.size, H.size)
+		if part.Size ~= s then part.Size = s end
+		part.Transparency = H.transparency
+		part.Color = H.color
+		part.CanCollide = false
+		part.Massless = true
+	end
+
+	local lastHb = 0
+	connect(RunService.Heartbeat, function()
+		local now = os.clock()
+		if now - lastHb < 0.1 then return end
+		lastHb = now
+
+		local H = Config.hitbox
+		if not H.enabled then
+			if next(hbOriginal) then hbRestoreAll() end
+			return
+		end
+
+		local names = (H.part == "Both") and { "HumanoidRootPart", "Head" } or { H.part }
+		for _, plr in ipairs(Players:GetPlayers()) do
+			if plr ~= lp then
+				local char = plr.Character
+				if char then
+					local hum = char:FindFirstChildOfClass("Humanoid")
+					local want = hum ~= nil and hum.Health > 0 and ((not H.teamCheck) or isEnemy(plr))
+					for _, n in ipairs(names) do
+						local part = char:FindFirstChild(n)
+						if part and part:IsA("BasePart") then
+							if want then hbApply(part) else hbRestore(part) end
+						end
+					end
+				end
+			end
+		end
+
+		for part in pairs(hbOriginal) do
+			if not part.Parent then hbOriginal[part] = nil end
+		end
+	end)
+end
+
+---------------------------------------------------------------- Aimbot tab
+local A = Config.aimbot
+do
+	local ap = tabs.Aimbot.page
+	header(ap, "Aimbot")
+	toggle(ap, "Enable Aimbot", A, "enabled")
+	cycle(ap, "Aim Mode", A, "mode", { "Hold RMB", "Hold LMB", "Always On" })
+	cycle(ap, "Target Part", A, "part", { "Head", "UpperTorso", "HumanoidRootPart" })
+	slider(ap, "FOV Radius", A, "fov", 20, 500, 5)
+	toggle(ap, "Instant Snap (no smoothing)", A, "snap")
+	slider(ap, "Smoothness (when snap is off)", A, "smooth", 1, 30, 1)
+	toggle(ap, "Auto Fire (when locked on)", A, "autoFire")
+	slider(ap, "Auto Fire Delay (s)", A, "fireDelay", 0.01, 1, 0.01)
+	toggle(ap, "Show FOV Circle", A, "showFov")
+	toggle(ap, "Team Check", A, "teamCheck")
+	toggle(ap, "Wall Check", A, "wallCheck")
+	toggle(ap, "Target NPCs", A, "targetNPCs")
+	toggle(ap, "DeathFix (skip players you killed)", A, "deathFix")
+
+	header(ap, "Hitbox Expander")
+	local H = Config.hitbox
+	toggle(ap, "Enable Hitbox Expander", H, "enabled", function(on)
+		if not on then hbRestoreAll() end
+	end)
+	slider(ap, "Hitbox Size", H, "size", 2, 40, 1)
+	cycle(ap, "Hitbox Part", H, "part", { "HumanoidRootPart", "Head", "Both" }, function() hbRestoreAll() end)
+	slider(ap, "Hitbox Transparency", H, "transparency", 0, 1, 0.05)
+	toggle(ap, "Team Check (skip teammates)", H, "teamCheck", function() hbRestoreAll() end)
+end
+
+local fovCircle, fovStroke
+do
+	fovCircle = Instance.new("Frame")
+	fovCircle.AnchorPoint = Vector2.new(0.5, 0.5)
+	fovCircle.BackgroundTransparency = 1
+	fovCircle.Visible = false
+	fovCircle.Parent = overlay
+	local fovCorner = Instance.new("UICorner")
+	fovCorner.CornerRadius = UDim.new(1, 0)
+	fovCorner.Parent = fovCircle
+	fovStroke = Instance.new("UIStroke")
+	fovStroke.Thickness = 1.5
+	fovStroke.Parent = fovCircle
+end
+
+local function isAiming()
+	if A.mode == "Always On" then return true end
+	if A.mode == "Hold LMB" then return UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) end
+	return UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+end
+
+local lastAimEntity = nil -- what the aimbot was last locked on (used by DeathFix)
+
+local function getTarget()
+	local mouse = UIS:GetMouseLocation()
+	local best, bestDist, bestE = nil, A.fov, nil
+	for _, e in ipairs(collectTargets(A.teamCheck, A.targetNPCs, A.deathFix)) do
+		local part = entityPart(e, A.part)
+		if part then
+			local pos, onScreen = camera:WorldToViewportPoint(part.Position)
+			if onScreen then
+				local d = (Vector2.new(pos.X, pos.Y) - mouse).Magnitude
+				if d < bestDist and (not A.wallCheck or isVisible(part, e.char)) then
+					best, bestDist, bestE = part, d, e
+				end
+			end
+		end
+	end
+	lastAimEntity = bestE
+	return best
+end
+
+---------------------------------------------------------------- ESP tab
+local E = Config.esp
+do
+	local ep = tabs.ESP.page
+	toggle(ep, "Enable ESP", E, "enabled")
+	toggle(ep, "Highlight (Chams)", E, "highlight")
+	toggle(ep, "Names", E, "names")
+	toggle(ep, "Health", E, "health")
+	toggle(ep, "Distance", E, "distance")
+	toggle(ep, "Team Check (hide teammates)", E, "teamCheck")
+	toggle(ep, "Wall Check (only when visible)", E, "wallCheck")
+	slider(ep, "Max Distance", E, "maxDist", 100, 3000, 50)
+	slider(ep, "Fill Transparency", E, "fillTransparency", 0, 1, 0.05)
+end
+
+local espCache = {}
+
+local function createEsp(plr)
+	local hl = Instance.new("Highlight")
+	hl.Name = plr.Name
+	hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	hl.Enabled = false
+	hl.Parent = espFolder
+
+	local bb = Instance.new("BillboardGui")
+	bb.Name = plr.Name
+	bb.Size = UDim2.fromOffset(160, 50)
+	bb.StudsOffset = Vector3.new(0, 3, 0)
+	bb.AlwaysOnTop = true
+	bb.Enabled = false
+	bb.Parent = espFolder
+
+	local txt = Instance.new("TextLabel")
+	txt.Size = UDim2.new(1, 0, 1, 0)
+	txt.BackgroundTransparency = 1
+	txt.TextStrokeTransparency = 0
+	txt.Font = Enum.Font.GothamBold
+	txt.TextSize = 12
+	txt.TextYAlignment = Enum.TextYAlignment.Bottom
+	txt.Parent = bb
+
+	espCache[plr] = { hl = hl, bb = bb, txt = txt }
+end
+
+local function removeEsp(plr)
+	local e = espCache[plr]
+	if e then
+		e.hl:Destroy()
+		e.bb:Destroy()
+		espCache[plr] = nil
+	end
+end
+connect(Players.PlayerRemoving, removeEsp)
+
+local function updateEsp(plr, e)
+	local show = E.enabled and plr ~= lp
+	local char, hum = nil, nil
+	local root, head
+	if show then
+		char, hum = getAlive(plr)
+		root = char and char:FindFirstChild("HumanoidRootPart")
+		head = char and char:FindFirstChild("Head")
+		show = char ~= nil and root ~= nil
+	end
+	if show and E.teamCheck and not isEnemy(plr) then show = false end
+
+	-- DeathFix: no ESP on a body the Killed remote marked as dead (a respawned player is a new model)
+	if show and (Config.bot.deathFix or Config.aimbot.deathFix) and isDeadMarked(char) then show = false end
+
+	local dist = 0
+	if show then
+		dist = (camera.CFrame.Position - root.Position).Magnitude
+		if dist > E.maxDist then show = false end
+	end
+	if show and E.wallCheck then
+		if not (isVisible(root, char) or (head and isVisible(head, char))) then show = false end
+	end
+
+	local showText = E.names or E.health or E.distance
+	e.hl.Enabled = show and E.highlight
+	e.bb.Enabled = show and showText
+	if not show then return end
+
+	if e.hl.Adornee ~= char then e.hl.Adornee = char end
+	e.hl.FillColor = E.fill
+	e.hl.OutlineColor = E.outline
+	e.hl.FillTransparency = E.fillTransparency
+
+	local adornee = head or root
+	if e.bb.Adornee ~= adornee then e.bb.Adornee = adornee end
+	local lines = {}
+	if E.names then lines[#lines + 1] = plr.DisplayName end
+	if E.health then lines[#lines + 1] = math.floor(hum.Health) .. "/" .. math.floor(hum.MaxHealth) .. " HP" end
+	if E.distance then lines[#lines + 1] = math.floor(dist) .. " studs" end
+	e.txt.Text = table.concat(lines, "\n")
+	e.txt.TextColor3 = E.outline
+end
+
+---------------------------------------------------------------- Bot tab (AI self-play)
+-- Controls YOUR avatar.
+--  Sniper style: every frame it looks for an enemy you can see (no wall in between), snaps the
+--                camera onto them and spam-fires the whole time it is locked on (see Fire Method).
+--  Melee style : walks up to the nearest enemy and swings your tool.
+local B = Config.bot
+local SW = Config.spawn
+
+local statusLabel, spawnStatus, setBotEnabled
+local function setStatus(s)
+	if not statusLabel then return end
+	local t = "Status: " .. s
+	if statusLabel.Text ~= t then statusLabel.Text = t end
+end
+
+do
+	local bp = tabs.Bot.page
+
+	-- sub tabs inside the Bot tab
+	local botSub = "Combat"
+	local subRow = row(bp, 30, true)
+	local subBtns = {}
+	local function applyBotSub()
+		for _, g in ipairs(groupObjs) do
+			g[1].Visible = (g[2] == botSub)
+		end
+		for name, b in pairs(subBtns) do
+			b.BackgroundColor3 = (name == botSub) and Config.ui.accent or Config.ui.secondary
+		end
+	end
+	local function makeSubBtn(i, name, label)
+		local b = makeButton(subRow, label, UDim2.new(0.5, -3, 1, 0), UDim2.new(0.5 * (i - 1), (i - 1) * 3, 0, 0))
+		subBtns[name] = b
+		b.MouseButton1Click:Connect(function()
+			botSub = name
+			applyBotSub()
+		end)
+	end
+	makeSubBtn(1, "Combat", "Bot / Combat")
+	makeSubBtn(2, "Spawn", "Auto Spawn / Bhop")
+	bindAccent(applyBotSub)
+
+	header(bp, "Bot")
+	setBotEnabled = toggle(bp, "Enable Bot (AI self-play)", B, "enabled", function(on)
+		if not on then setStatus("off") end
+	end)
+
+	do
+		local statusRow = row(bp, 52)
+		statusLabel = makeLabel(statusRow, "Status: off", UDim2.new(1, -20, 1, 0), UDim2.new(0, 10, 0, 0))
+		statusLabel.TextWrapped = true
+		statusLabel.TextSize = 12
+	end
+
+	currentGroup = "Combat"
+	cycle(bp, "Combat Style", B, "style", { "Sniper", "Melee" })
+	cycle(bp, "Fire Method", B, "fireMethod", { "LMB Spam", "LMB Hold", "Tool Activate", "Both" })
+	toggle(bp, "DeathFix (skip players you killed)", B, "deathFix")
+	toggle(bp, "Team Check (ignore teammates)", B, "teamCheck")
+	toggle(bp, "Target NPCs", B, "targetNPCs")
+	textInput(bp, "NPC Hitbox Part (required)", B, "npcHitbox", "blank = any NPC")
+	textInput(bp, "NPC Folder (optional)", B, "npcFolder", "blank = whole Workspace")
+	textInput(bp, "NPC Name Filter", B, "npcName", "blank = any")
+	toggle(bp, "Use Pathfinding", B, "usePathfinding")
+	toggle(bp, "Wander When No Target", B, "wander")
+	toggle(bp, "Auto Equip Tool", B, "autoEquip")
+	textInput(bp, "Tool Name Filter", B, "toolName", "e.g. Sniper (blank = any)")
+	slider(bp, "Max Chase Distance", B, "maxChase", 50, 3000, 50)
+	slider(bp, "Wander Radius", B, "wanderRadius", 10, 100, 5)
+	keybind(bp, "Bot Toggle Key", B, "toggleKey")
+
+	header(bp, "Sniper Style")
+	cycle(bp, "Target Priority", B, "sniperPriority", { "Nearest", "Lowest Health", "Closest to Crosshair" })
+	cycle(bp, "Hit Part", B, "hitPart", { "Head", "UpperTorso", "HumanoidRootPart" })
+	toggle(bp, "Fallback To Body If Head Hidden", B, "bodyFallback")
+	toggle(bp, "Only Fire When Visible (wall check)", B, "visibleOnly")
+	slider(bp, "Sniper Range (studs)", B, "sniperRange", 100, 3000, 50)
+	slider(bp, "Fire Delay (s)", B, "fireDelay", 0.01, 1, 0.01)
+	cycle(bp, "Movement", B, "sniperMove", { "Stand Still", "Wander", "Hunt" })
+
+	header(bp, "Melee Style")
+	slider(bp, "Attack Range (studs)", B, "attackRange", 3, 25, 1)
+	slider(bp, "Melee Attack Delay (s)", B, "attackDelay", 0.05, 1, 0.05)
+
+	-- Auto Spawn / Bhop sub tab
+	currentGroup = "Spawn"
+	header(bp, "Auto Spawn (after YOU die)")
+	toggle(bp, "Auto Spawn (press key after death)", SW, "autoSpawn")
+	keybind(bp, "Spawn Key", SW, "spawnKey")
+	slider(bp, "Delay After Death (s)", SW, "spawnDelay", 0, 3, 0.1)
+	toggle(bp, "Retry Until Respawned", SW, "spawnRetry")
+	slider(bp, "Retry Interval (s)", SW, "spawnInterval", 0.3, 3, 0.1)
+	header(bp, "Bhop")
+	toggle(bp, "Bunny Hop (auto jump)", SW, "bhop")
+	toggle(bp, "Only While Holding Space", SW, "bhopHoldSpace")
+	do
+		local spawnStatusRow = row(bp, 40)
+		spawnStatus = makeLabel(spawnStatusRow, "Spawn: waiting for you to die (Killed remote)", UDim2.new(1, -20, 1, 0), UDim2.new(0, 10, 0, 0))
+		spawnStatus.TextWrapped = true
+		spawnStatus.TextSize = 12
+	end
+	currentGroup = nil
+	applyBotSub()
+end
+
+local botState = {
+	target = nil,
+	sniperTarget = nil,
+	waypoints = nil,
+	wpIndex = 2,
+	computing = false,
+	lastPath = 0,
+	lastScan = 0,
+	lastAttack = 0,
+	wanderPos = nil,
+	wanderUntil = 0,
+	lastPos = nil,
+	lastStuckCheck = 0,
+	wasActive = false,
+	stopUntil = 0,
+	pathToken = 0,
+	holdActive = false,
+	holdUntil = 0,
+	fireInfo = nil,
+	shots = 0,
+	lockChar = nil,
+	lockSince = 0,
+	lockHp = 0,
+}
+
+local function findBotTarget(root)
+	local best, bestD = nil, B.maxChase
+	for _, e in ipairs(collectTargets(B.teamCheck, B.targetNPCs, B.deathFix)) do
+		local r = entityRoot(e)
+		if r then
+			local d = (r.Position - root.Position).Magnitude
+			if d < bestD then best, bestD = e, d end
+		end
+	end
+	return best
+end
+
+---------------------------------------------------------------- DeathFix (everyone who dies) + auto respawn
+-- Deaths are detected three ways:
+--   * the Killed remote  ReplicatedStorage.Remote.GameService.GameClient.Killed
+--     OnClientEvent(killer, victim, time, info)  -- ANY killer, ANY victim
+--   * Humanoid.Died of every player
+--   * a player getting a new Character (their old model is now a body)
+-- When someone else dies: their character is marked dead (bot/aimbot stop targeting it), their ESP is
+-- deleted (nobody else's), and leftover body models are caught by checkNewBodies().
+-- When YOU die (victim == you): Auto Spawn waits Delay After Death and presses the spawn key.
+local unloaded = false
+local deathConns = {} -- player -> Humanoid.Died connection
+local respawn = { dueAt = nil, presses = 0 }
+
+do
+	local killedHooked = false
+	local lastPos = {} -- player -> last known HumanoidRootPart position
+	local lastChar = {} -- player -> last Character model we saw
+
+	local function victimInfo(victim)
+		local plr, char
+		if typeof(victim) == "Instance" then
+			if victim:IsA("Player") then
+				plr = victim
+			elseif victim:IsA("Model") then
+				char = victim
+				plr = Players:GetPlayerFromCharacter(victim)
+			end
+		elseif type(victim) == "string" then
+			local p = Players:FindFirstChild(victim)
+			if p and p:IsA("Player") then plr = p end
+		end
+		if plr and not char then char = plr.Character end
+		return plr, char
+	end
+
+	local function scheduleRespawn()
+		if not SW.autoSpawn or respawn.dueAt then return end
+		respawn.presses = 0
+		respawn.dueAt = os.clock() + SW.spawnDelay
+		spawnStatus.Text = "Spawn: you died - pressing " .. SW.spawnKey.Name .. " in " .. SW.spawnDelay .. "s"
+	end
+
+	-- someone (not me) died. killedByMe = the killer was me.
+	local function handleDeath(plr, char, killedByMe, nameHint)
+		if plr == lp then return end
+		local pos = plr and lastPos[plr] or nil
+		if char then
+			local r = char:FindFirstChild("HumanoidRootPart")
+			if r then pos = r.Position end
+			markDead(char)
+		end
+
+		local names = {}
+		if plr then
+			names[plr.Name] = true
+			names[plr.DisplayName] = true
+		end
+		if char then names[char.Name] = true end
+		if nameHint then names[nameHint] = true end
+		recentDeaths[#recentDeaths + 1] = { t = os.clock(), pos = pos, names = names }
+
+		-- if the bot/aimbot is locked on it right now, drop it this very frame
+		local cands = {}
+		if botState.sniperTarget then cands[#cands + 1] = botState.sniperTarget end
+		if botState.target then cands[#cands + 1] = botState.target end
+		if lastAimEntity then cands[#cands + 1] = lastAimEntity end
+		for _, e in ipairs(cands) do
+			if e.char then
+				-- the thing I was locked on when I got the kill is the body, even if the game named it differently
+				if killedByMe and not e.plr and pos then
+					local r = entityRoot(e)
+					if r and (r.Position - pos).Magnitude < 30 then markDead(e.char) end
+				end
+				if isDeadMarked(e.char) then
+					if botState.target == e then botState.target = nil end
+					if botState.sniperTarget == e then botState.sniperTarget = nil end
+				end
+			end
+		end
+
+		-- delete THEIR esp only (it comes back hidden-then-visible once they respawn into a new model)
+		if plr and (Config.bot.deathFix or Config.aimbot.deathFix) then
+			removeEsp(plr)
+		end
+		if plr then
+			plr.CharacterAdded:Once(function(c) deadChars[c] = nil end)
+		end
+
+		checkNewBodies()
+	end
+
+	local function onKilled(killer, victim)
+		local plr, char = victimInfo(victim)
+		if plr == lp or victim == lp then
+			scheduleRespawn() -- I died
+			return
+		end
+		handleDeath(plr, char, killer == lp, type(victim) == "string" and victim or nil)
+	end
+
+	local function hookHumanoid(plr, char)
+		local hum = char:WaitForChild("Humanoid", 5)
+		if not hum or unloaded then return end
+		if deathConns[plr] then deathConns[plr]:Disconnect() end
+		deathConns[plr] = hum.Died:Connect(function()
+			if plr == lp then
+				if not killedHooked then scheduleRespawn() end -- fallback only if the remote isn't available
+			else
+				handleDeath(plr, char, false)
+			end
+		end)
+	end
+
+	local function watchPlayer(plr)
+		if plr.Character then
+			lastChar[plr] = plr.Character
+			task.spawn(hookHumanoid, plr, plr.Character)
+		end
+		connect(plr.CharacterAdded, function(c)
+			if plr == lp then
+				respawn.dueAt = nil -- I'm alive again: stop pressing the spawn key
+			else
+				local old = lastChar[plr]
+				lastChar[plr] = c
+				if old and old ~= c then handleDeath(plr, old, false) end -- old model = a body now
+			end
+			task.spawn(hookHumanoid, plr, c)
+		end)
+	end
+	for _, p in ipairs(Players:GetPlayers()) do watchPlayer(p) end
+	connect(Players.PlayerAdded, watchPlayer)
+	connect(Players.PlayerRemoving, function(plr)
+		lastPos[plr] = nil
+		lastChar[plr] = nil
+		if deathConns[plr] then
+			deathConns[plr]:Disconnect()
+			deathConns[plr] = nil
+		end
+	end)
+
+	-- remember where everyone was, so a death position is known even if the model is already gone
+	local lastPosTick = 0
+	connect(RunService.Heartbeat, function()
+		local now = os.clock()
+		if now - lastPosTick < 0.2 then return end
+		lastPosTick = now
+		for _, plr in ipairs(Players:GetPlayers()) do
+			local r = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
+			if r then lastPos[plr] = r.Position end
+		end
+	end)
+
+	task.spawn(function()
+		local ok, ev = pcall(function()
+			local r = ReplicatedStorage:WaitForChild("Remote", 15)
+			local g = r:WaitForChild("GameService", 15)
+			local c = g:WaitForChild("GameClient", 15)
+			return c:WaitForChild("Killed", 15)
+		end)
+		if unloaded then return end
+		if ok and ev and ev:IsA("RemoteEvent") then
+			killedHooked = true
+			connect(ev.OnClientEvent, onKilled)
+		else
+			warn("[LSW] DeathFix: couldn't find ReplicatedStorage.Remote.GameService.GameClient.Killed")
+		end
+	end)
+end
+
+---------------------------------------------------------------- Firing
+-- Real left-mouse input. Tries VirtualInputManager first, then the executor functions
+-- mouse1press/mouse1release. If neither exists, a plain LocalScript can't click, and the bot sets
+-- the "BotFire" attribute on YOUR PLAYER (lp:SetAttribute) so your own game script can react.
+local VIM
+pcall(function() VIM = game:GetService("VirtualInputManager") end)
+local genv = getfenv()
+
+local lmbUp, fireTool
+do
+	local m1press, m1release = genv.mouse1press, genv.mouse1release
+	local lmbHeld = false
+	local lmbVia = nil
+	local lmbPressedAt = 0
+
+	local HOLD_TIME = 0.025 -- how long each spam click stays pressed
+	local MIN_PERIOD = 0.05 -- fastest spam rate (about 20 clicks per second)
+
+	local function toolMatches(t)
+		if B.toolName == "" then return true end
+		return string.find(string.lower(t.Name), string.lower(B.toolName), 1, true) ~= nil
+	end
+
+	local function getTool(char, allowBackpack)
+		for _, t in ipairs(char:GetChildren()) do
+			if t:IsA("Tool") and toolMatches(t) then return t end
+		end
+		if allowBackpack then
+			local backpack = lp:FindFirstChildOfClass("Backpack")
+			if backpack then
+				for _, t in ipairs(backpack:GetChildren()) do
+					if t:IsA("Tool") and toolMatches(t) then return t end
+				end
+			end
+		end
+	end
+
+	-- Raw senders. They never trust our own idea of whether the button is down, so a dropped event
+	-- can't leave the bot "stuck" thinking it's pressed.
+	local function rawDown()
+		local m = UIS:GetMouseLocation()
+		if VIM then
+			local ok = pcall(function() VIM:SendMouseButtonEvent(m.X, m.Y, 0, true, game, 0) end)
+			if ok then return "VirtualInputManager" end
+		end
+		if typeof(m1press) == "function" then
+			if pcall(m1press) then return "mouse1press" end
+		end
+		return nil
+	end
+
+	local function rawUp()
+		local m = UIS:GetMouseLocation()
+		if VIM then
+			local ok = pcall(function() VIM:SendMouseButtonEvent(m.X, m.Y, 0, false, game, 0) end)
+			if ok then return true end
+		end
+		if typeof(m1release) == "function" then
+			if pcall(m1release) then return true end
+		end
+		return false
+	end
+
+	local function lmbDown()
+		if lmbHeld then return true end
+		local via = rawDown()
+		if via then
+			lmbHeld = true
+			lmbVia = via
+			lmbPressedAt = os.clock()
+			return true
+		end
+		return false
+	end
+
+	-- force = send a release even if we think it's already up
+	function lmbUp(force)
+		if not lmbHeld and not force then return end
+		lmbHeld = false
+		rawUp()
+	end
+
+	-- Fires using B.fireMethod. The LMB methods do NOT need a tool at all.
+	--   LMB Spam       one clean click (release -> press -> release) every Fire Delay, for as long as
+	--                  you are locked on (never faster than ~20 clicks/second)
+	--   LMB Hold       holds the button down while on target
+	--   Tool Activate  tool:Activate() only (needs a tool)
+	--   Both           LMB spam + tool:Activate()
+	local CANT_SEND = "CAN'T SEND LMB here (no VirtualInputManager/mouse1press). Hook lp attribute BotFire"
+
+	function fireTool(char, hum, delay, equip)
+		local now = os.clock()
+		local method = B.fireMethod
+		local usesTool = (method == "Tool Activate" or method == "Both")
+
+		local tool = getTool(char, equip and usesTool)
+		if tool and tool.Parent ~= char then
+			if equip and usesTool then hum:EquipTool(tool) end
+			if tool.Parent ~= char then tool = nil end
+		end
+		if method == "Tool Activate" and not tool then
+			botState.fireInfo = "Tool Activate needs a tool - switch Fire Method to LMB Spam"
+			return false
+		end
+
+		-- keeps the release timer alive: LMB is let go shortly after we lose the target
+		if method ~= "Tool Activate" then
+			botState.holdActive = true
+			botState.holdUntil = now + 0.15
+		end
+
+		if method == "LMB Hold" then
+			if lmbDown() then
+				botState.fireInfo = "LMB held (" .. tostring(lmbVia) .. ")"
+				lp:SetAttribute("BotFire", now)
+				return true
+			end
+			botState.fireInfo = CANT_SEND
+			return false
+		end
+
+		local period = delay
+		if method == "LMB Spam" or method == "Both" then period = math.max(delay, MIN_PERIOD) end
+		if now - botState.lastAttack < period then return false end
+		botState.lastAttack = now
+
+		local sent = false
+		if method == "LMB Spam" or method == "Both" then
+			rawUp() -- make sure the button is up first so the game always sees a fresh press
+			local via = rawDown()
+			if via then
+				lmbHeld = true
+				lmbVia = via
+				lmbPressedAt = now
+				sent = true
+				task.delay(HOLD_TIME, function()
+					if lmbHeld and lmbPressedAt == now then lmbUp(true) end
+				end)
+			end
+		end
+		if tool and usesTool then tool:Activate() end
+
+		botState.shots += 1
+
+		-- hooks for your own game scripts
+		lp:SetAttribute("BotFire", now)
+		if tool then tool:SetAttribute("BotFire", now) end
+
+		if method == "Tool Activate" then
+			botState.fireInfo = "tool:Activate() shot #" .. botState.shots
+		elseif sent then
+			botState.fireInfo = "LMB spam (" .. tostring(lmbVia) .. ") shot #" .. botState.shots
+		else
+			botState.fireInfo = CANT_SEND
+		end
+		return true
+	end
+end
+
+local function findSniperTarget(origin)
+	local look = camera.CFrame.LookVector
+	local best, bestPart, bestScore = nil, nil, math.huge
+	for _, e in ipairs(collectTargets(B.teamCheck, B.targetNPCs, B.deathFix)) do
+		local part = entityPart(e, B.hitPart)
+		if part then
+			local dist = (part.Position - origin).Magnitude
+			if dist <= B.sniperRange then
+				local aimPart = nil
+				if not B.visibleOnly or isVisible(part, e.char, origin) then
+					aimPart = part
+				elseif B.bodyFallback then
+					local body = entityRoot(e)
+					if body and body ~= part and isVisible(body, e.char, origin) then aimPart = body end
+				end
+				if aimPart then
+					local score
+					if B.sniperPriority == "Lowest Health" then
+						score = (e.hum and e.hum.Health or 100) + dist / 100000
+					elseif B.sniperPriority == "Closest to Crosshair" then
+						local dir = (aimPart.Position - camera.CFrame.Position).Unit
+						score = math.acos(math.clamp(dir:Dot(look), -1, 1))
+					else
+						score = dist
+					end
+					if score < bestScore then best, bestPart, bestScore = e, aimPart, score end
+				end
+			end
+		end
+	end
+	return best, bestPart
+end
+
+local chaseStep, wanderStep
+do
+	local function requestPath(root, goal)
+		if botState.computing then return end
+		botState.computing = true
+		botState.lastPath = os.clock()
+		local token = botState.pathToken
+		task.spawn(function()
+			local path = PathfindingService:CreatePath({ AgentRadius = 2, AgentHeight = 5, AgentCanJump = true })
+			local ok = pcall(function() path:ComputeAsync(root.Position, goal) end)
+			if token ~= botState.pathToken then
+				botState.computing = false
+				return
+			end
+			if ok and path.Status == Enum.PathStatus.Success then
+				botState.waypoints = path:GetWaypoints()
+				botState.wpIndex = 2
+			else
+				botState.waypoints = nil
+			end
+			botState.computing = false
+		end)
+	end
+
+	local function followPath(hum, root, fallbackPos)
+		local wps = botState.waypoints
+		local wp = wps and wps[botState.wpIndex]
+		if wp then
+			hum:MoveTo(wp.Position)
+			if wp.Action == Enum.PathWaypointAction.Jump then hum.Jump = true end
+			local flat = Vector3.new(wp.Position.X - root.Position.X, 0, wp.Position.Z - root.Position.Z)
+			if flat.Magnitude < 3 then botState.wpIndex += 1 end
+		else
+			hum:MoveTo(fallbackPos)
+		end
+	end
+
+	function chaseStep(hum, root, tRoot, now)
+		if B.usePathfinding then
+			if now - botState.lastPath > 0.7 then requestPath(root, tRoot.Position) end
+			followPath(hum, root, tRoot.Position)
+		else
+			hum:MoveTo(tRoot.Position)
+		end
+	end
+
+	function wanderStep(hum, root, now)
+		local needNew = (not botState.wanderPos) or now > botState.wanderUntil
+		if not needNew then
+			local flat = Vector3.new(botState.wanderPos.X - root.Position.X, 0, botState.wanderPos.Z - root.Position.Z)
+			needNew = flat.Magnitude < 4
+		end
+		if needNew then
+			local a = math.random() * math.pi * 2
+			local r = math.random(10, math.max(B.wanderRadius, 11))
+			botState.wanderPos = root.Position + Vector3.new(math.cos(a) * r, 0, math.sin(a) * r)
+			botState.wanderUntil = now + 6
+		end
+		hum:MoveTo(botState.wanderPos)
+	end
+end
+
+-- forceRelease: also send a mouse-up even if we think the button is already up (used on disable)
+local function stopBotMovement(forceRelease)
+	botState.pathToken += 1 -- throws away any path that is still being computed
+	botState.waypoints = nil
+	botState.target = nil
+	botState.sniperTarget = nil
+	botState.wanderPos = nil
+	botState.holdActive = false
+	lmbUp(forceRelease)
+	local c = lp.Character
+	local h = c and c:FindFirstChildOfClass("Humanoid")
+	local r = c and c:FindFirstChild("HumanoidRootPart")
+	if h and r then
+		h:Move(Vector3.zero, false)
+		h:MoveTo(r.Position)
+	end
+end
+
+-- Movement + melee logic (aiming/firing for sniper style happens in the render step below)
+connect(RunService.Heartbeat, function()
+	if not B.enabled then
+		if botState.wasActive then
+			botState.wasActive = false
+			botState.stopUntil = os.clock() + 0.4
+			stopBotMovement(true)
+		elseif os.clock() < botState.stopUntil then
+			stopBotMovement() -- keep cancelling movement for a moment so it really stops
+		end
+		return
+	end
+	botState.wasActive = true
+
+	local char = lp.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if not (hum and root) or hum.Health <= 0 then
+		setStatus("waiting for respawn")
+		botState.waypoints = nil
+		return
+	end
+	local now = os.clock()
+
+	if now - botState.lastScan > 0.25 then
+		botState.lastScan = now
+		botState.target = findBotTarget(root)
+	end
+
+	local tAlive = botState.target ~= nil and entityAlive(botState.target, B.deathFix)
+	local tRoot = tAlive and entityRoot(botState.target) or nil
+	local moving = false
+
+	if B.style == "Sniper" then
+		if botState.sniperTarget then
+			hum:MoveTo(root.Position) -- hold still while shooting
+		else
+			local mode = B.sniperMove
+			if mode == "Hunt" and tRoot then
+				setStatus("hunting " .. botState.target.name)
+				chaseStep(hum, root, tRoot, now)
+				moving = true
+			elseif mode == "Wander" or (mode == "Hunt" and B.wander) then
+				botState.waypoints = nil
+				setStatus("wandering")
+				wanderStep(hum, root, now)
+				moving = true
+			else
+				setStatus("scanning")
+			end
+		end
+	else
+		if tRoot then
+			local name = botState.target.name
+			local dist = (tRoot.Position - root.Position).Magnitude
+			if dist <= B.attackRange then
+				setStatus("attacking " .. name)
+				if dist > B.attackRange * 0.5 then
+					hum:MoveTo(tRoot.Position)
+					moving = true
+				else
+					hum:MoveTo(root.Position)
+				end
+				faceFlat(root, tRoot.Position)
+				fireTool(char, hum, B.attackDelay, B.autoEquip)
+			else
+				setStatus("chasing " .. name)
+				chaseStep(hum, root, tRoot, now)
+				moving = true
+			end
+		else
+			botState.waypoints = nil
+			if B.wander then
+				setStatus("wandering")
+				wanderStep(hum, root, now)
+				moving = true
+			else
+				setStatus("idle (no target)")
+			end
+		end
+	end
+
+	-- stuck detection: if we should be moving but barely moved, jump (and pick a new wander spot)
+	if moving then
+		if now - botState.lastStuckCheck > 0.6 then
+			if botState.lastPos and (root.Position - botState.lastPos).Magnitude < 0.6 then
+				hum.Jump = true
+				botState.wanderUntil = 0
+			end
+			botState.lastPos = root.Position
+			botState.lastStuckCheck = now
+		end
+	else
+		botState.lastPos = nil
+	end
+end)
+
+---------------------------------------------------------------- Auto spawn (spam key) + bhop
+do
+	local keypressFn, keyreleaseFn = genv.keypress, genv.keyrelease
+
+	-- presses and releases a key; returns how it was sent, or nil if it couldn't be
+	local function sendKey(kc)
+		if VIM then
+			local ok = pcall(function() VIM:SendKeyEvent(true, kc, false, game) end)
+			if ok then
+				task.delay(0.02, function()
+					pcall(function() VIM:SendKeyEvent(false, kc, false, game) end)
+				end)
+				return "VirtualInputManager"
+			end
+		end
+		if typeof(keypressFn) == "function" and typeof(keyreleaseFn) == "function" then
+			local v = kc.Value
+			if v >= 97 and v <= 122 then v -= 32 end -- letters: Roblox lowercase -> virtual-key code
+			local ok = pcall(keypressFn, v)
+			if ok then
+				task.delay(0.02, function() pcall(keyreleaseFn, v) end)
+				return "keypress"
+			end
+		end
+		return nil
+	end
+
+	connect(RunService.Heartbeat, function()
+		local now = os.clock()
+		local c = lp.Character
+		local hum = c and c:FindFirstChildOfClass("Humanoid")
+
+		-- Auto Spawn: nothing happens until the Killed remote says I died (see DeathFix section)
+		if not SW.autoSpawn then respawn.dueAt = nil end
+		if SW.autoSpawn and respawn.dueAt and now >= respawn.dueAt then
+			local via = sendKey(SW.spawnKey)
+			respawn.presses += 1
+			lp:SetAttribute("BotSpawn", now) -- hook for your own game script
+			if via then
+				spawnStatus.Text = "Spawn: pressed " .. SW.spawnKey.Name .. " #" .. respawn.presses .. " (" .. via .. ")"
+			else
+				spawnStatus.Text = "Spawn: CAN'T SEND KEY here. Hook lp attribute BotSpawn"
+			end
+			if SW.spawnRetry and respawn.presses < 6 then
+				respawn.dueAt = now + SW.spawnInterval
+			else
+				respawn.dueAt = nil
+			end
+		end
+
+		if SW.bhop and hum and hum.Health > 0 then
+			local holding = (not SW.bhopHoldSpace) or UIS:IsKeyDown(Enum.KeyCode.Space)
+			if holding and not UIS:GetFocusedTextBox() and hum.FloorMaterial ~= Enum.Material.Air then
+				hum.Jump = true
+			end
+		end
+	end)
+end
+
+---------------------------------------------------------------- Main loop
+RunService:BindToRenderStep("LSW_Main", Enum.RenderPriority.Camera.Value + 1, function(dt)
+	updateRainbow()
+	updateSnow(dt)
+
+	camera = Workspace.CurrentCamera
+	if not camera then return end
+
+	-- FOV circle
+	local showCircle = A.enabled and A.showFov
+	fovCircle.Visible = showCircle
+	if showCircle then
+		local m = UIS:GetMouseLocation()
+		fovCircle.Size = UDim2.fromOffset(A.fov * 2, A.fov * 2)
+		fovCircle.Position = UDim2.fromOffset(m.X, m.Y)
+		fovStroke.Color = A.fovColor
+	end
+
+	-- Sniper bot: the moment an enemy is visible -> snap onto them and spam-fire while locked on
+	botState.sniperTarget = nil
+	if B.enabled and B.style == "Sniper" then
+		local char = lp.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		local root = char and char:FindFirstChild("HumanoidRootPart")
+		local head = char and char:FindFirstChild("Head")
+		if hum and root and hum.Health > 0 then
+			local origin = head and head.Position or camera.CFrame.Position
+			local plr, part = findSniperTarget(origin)
+			if plr and part then
+				botState.sniperTarget = plr
+				snapCameraTo(part.Position)
+				faceFlat(root, part.Position)
+				fireTool(char, hum, B.fireDelay, B.autoEquip)
+				setStatus("sniping " .. plr.name .. " | " .. tostring(botState.fireInfo or "..."))
+
+				-- stuck-lock guard: a NON-player target with a Humanoid whose health never changes while
+				-- we shoot it for 4+ seconds is a leftover body / unhittable ghost -> mark it dead
+				if B.deathFix and not plr.plr and plr.hum then
+					local t2 = os.clock()
+					if botState.lockChar ~= plr.char then
+						botState.lockChar = plr.char
+						botState.lockSince = t2
+						botState.lockHp = plr.hum.Health
+					elseif plr.hum.Health ~= botState.lockHp then
+						botState.lockSince = t2
+						botState.lockHp = plr.hum.Health
+					elseif t2 - botState.lockSince > 4 then
+						markDead(plr.char)
+						botState.lockChar = nil
+					end
+				else
+					botState.lockChar = nil
+				end
+			else
+				botState.lockChar = nil
+			end
+		end
+	end
+
+	-- Aimbot (player-controlled)
+	if A.enabled and isAiming() then
+		local target = getTarget()
+		if target then
+			if A.snap then
+				snapCameraTo(target.Position)
+			else
+				local goal = CFrame.lookAt(camera.CFrame.Position, target.Position)
+				camera.CFrame = camera.CFrame:Lerp(goal, 1 / math.max(A.smooth, 1))
+			end
+			if A.autoFire then
+				local c = lp.Character
+				local h = c and c:FindFirstChildOfClass("Humanoid")
+				if c and h then fireTool(c, h, A.fireDelay, false) end
+			end
+		end
+	end
+
+	-- release a held LMB shortly after we lost the target
+	if botState.holdActive and os.clock() > botState.holdUntil then
+		botState.holdActive = false
+		lmbUp(true)
+	end
+
+	-- ESP
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= lp then
+			if not espCache[plr] then createEsp(plr) end
+			updateEsp(plr, espCache[plr])
+		end
+	end
+end)
+
+---------------------------------------------------------------- Colors tab (every color you can change)
+do
+	local cp = tabs.Colors.page
+
+	header(cp, "Rainbow Mode")
+	slider(cp, "Rainbow Speed", Config.ui, "rainbowSpeed", 0.02, 1, 0.02)
+	actionButton(cp, "Rainbow: ALL ON", Color3.fromRGB(150, 90, 230), function()
+		for _, p in ipairs(rainbowPickers) do p.setOn(true) end
+	end)
+	actionButton(cp, "Rainbow: ALL OFF", Color3.fromRGB(120, 120, 140), function()
+		for _, p in ipairs(rainbowPickers) do p.setOn(false) end
+	end)
+
+	header(cp, "Interface")
+	colorPick(cp, "Primary (buttons, toggles, tabs)", Config.ui, "accent", themeChanged)
+	colorPick(cp, "Secondary (panels, rows, tabs)", Config.ui, "secondary", themeChanged)
+	slider(cp, "Secondary Transparency", Config.ui, "secondaryTransparency", 0, 0.9, 0.05, themeChanged)
+	colorPick(cp, "Background", Config.ui, "background", themeChanged)
+	slider(cp, "Background Transparency", Config.ui, "transparency", 0, 0.6, 0.05, themeChanged)
+
+	header(cp, "Aimbot")
+	colorPick(cp, "FOV Circle", A, "fovColor")
+
+	header(cp, "Hitbox")
+	colorPick(cp, "Hitbox Color", Config.hitbox, "color")
+
+	header(cp, "ESP")
+	colorPick(cp, "ESP Fill", E, "fill")
+	colorPick(cp, "ESP Outline / Text", E, "outline")
+
+	header(cp, "Snowfall")
+	colorPick(cp, "Snow Color", Config.snow, "color")
+end
+
+---------------------------------------------------------------- Presets (save / load / autosave)
+local presetStatus, savePreset, loadPreset, deletePreset, applyExtras, refreshAllUi
+do
+	local function setPresetStatus(s)
+		if presetStatus then presetStatus.Text = s end
+	end
+
+	local function cleanName(name)
+		name = tostring(name or ""):match("^%s*(.-)%s*$")
+		if name == "" then name = "default" end
+		return name
+	end
+
+	local function listNames(blob)
+		local names = {}
+		for n in pairs(blob.presets) do names[#names + 1] = n end
+		table.sort(names)
+		return #names > 0 and table.concat(names, ", ") or "none"
+	end
+
+	-- applies the parts of a preset that aren't plain Config values
+	function applyExtras(data)
+		if type(data.rainbow) == "table" then
+			for i, p in ipairs(rainbowPickers) do
+				p.on = (data.rainbow[i] == true)
+			end
+		end
+		if type(data.scripts) == "table" then
+			clearSlots()
+			for _, s in ipairs(data.scripts) do
+				if type(s) == "table" and type(s.code) == "string" then
+					addSlot(s.code, tostring(s.interval or "1"))
+				end
+			end
+		end
+	end
+
+	function refreshAllUi()
+		main.Size = SIZES[Config.ui.size] or SIZES.Medium
+		setSnowAmount(Config.snow.amount)
+		hbRestoreAll()
+		for _, fn in ipairs(refreshFns) do fn() end
+		themeChanged()
+	end
+
+	local saving = false
+	function savePreset(name, silent)
+		if saving then return false end
+		saving = true
+		name = cleanName(name)
+		local blob = getBlob(false)
+		blob.presets[name] = snapshot()
+		blob.startup = name
+		local ok = writeBlob(blob)
+		saving = false
+		if ok then
+			if not silent then
+				setPresetStatus("saved '" .. name .. "' (will load on start) | presets: " .. listNames(blob))
+			end
+		else
+			dirty = true
+			setPresetStatus("SAVE FAILED - storage: " .. Storage.kind
+				.. (Storage.kind == "none" and " (add LSW_PresetServer.lua to ServerScriptService)" or ""))
+		end
+		return ok
+	end
+
+	function loadPreset(name)
+		name = cleanName(name)
+		local blob = getBlob(true)
+		local data = blob.presets[name]
+		if type(data) ~= "table" then
+			setPresetStatus("no preset '" .. name .. "' | presets: " .. listNames(blob))
+			return
+		end
+		Config.preset.name = name
+		applySettings(data.settings)
+		applyExtras(data)
+		refreshAllUi()
+		setPresetStatus("loaded '" .. name .. "'")
+	end
+
+	function deletePreset(name)
+		name = cleanName(name)
+		local blob = getBlob(true)
+		if blob.presets[name] == nil then
+			setPresetStatus("no preset '" .. name .. "' | presets: " .. listNames(blob))
+			return
+		end
+		blob.presets[name] = nil
+		if blob.startup == name then blob.startup = nil end
+		if writeBlob(blob) then
+			setPresetStatus("deleted '" .. name .. "' | presets: " .. listNames(blob))
+		else
+			setPresetStatus("DELETE FAILED - storage: " .. Storage.kind)
+		end
+	end
+
+	-- autosave: when something changed, write it at most once every 10 seconds
+	local lastAuto = 0
+	connect(RunService.Heartbeat, function()
+		if not dirty or not Config.preset.autoSave or Storage.kind == "none" then return end
+		local now = os.clock()
+		if now - lastAuto < 10 then return end
+		lastAuto = now
+		dirty = false
+		task.spawn(savePreset, Config.preset.name, true)
+	end)
+end
+
+---------------------------------------------------------------- Settings tab
+do
+	local sp = tabs.Settings.page
+
+	header(sp, "Presets")
+	textInput(sp, "Preset Name", Config.preset, "name", "default")
+	toggle(sp, "Auto-Save Changes", Config.preset, "autoSave")
+
+	do
+		local presetBtnRow = row(sp, 34, true)
+		local function presetButton(i, text, color, fn)
+			local b = makeButton(presetBtnRow, text, UDim2.new(1 / 3, -4, 1, 0), UDim2.new((i - 1) / 3, 0, 0, 0), color)
+			b.MouseButton1Click:Connect(fn)
+		end
+		presetButton(1, "Save", ON_COLOR, function() task.spawn(savePreset, Config.preset.name) end)
+		presetButton(2, "Load", Color3.fromRGB(90, 120, 255), function() task.spawn(loadPreset, Config.preset.name) end)
+		presetButton(3, "Delete", OFF_COLOR, function() task.spawn(deletePreset, Config.preset.name) end)
+
+		local presetStatusRow = row(sp, 46)
+		presetStatus = makeLabel(presetStatusRow, "", UDim2.new(1, -20, 1, 0), UDim2.new(0, 10, 0, 0))
+		presetStatus.TextWrapped = true
+		presetStatus.TextSize = 12
+		if startupName then
+			presetStatus.Text = "auto-loaded '" .. startupName .. "' (storage: " .. Storage.kind .. ")"
+		elseif Storage.kind == "none" then
+			presetStatus.Text = "No storage found - add LSW_PresetServer.lua to ServerScriptService to keep presets."
+		else
+			presetStatus.Text = "No saved preset yet (storage: " .. Storage.kind .. "). Press Save."
+		end
+	end
+
+	header(sp, "Window")
+	cycle(sp, "Window Size", Config.ui, "size", { "Small", "Medium", "Large" }, function(v)
+		main.Size = SIZES[v]
+	end)
+	keybind(sp, "Hide/Show GUI Key", Config.ui, "toggleKey")
+	keybind(sp, "Minimize Key", Config.ui, "minKey")
+
+	header(sp, "Snowfall")
+	toggle(sp, "Snowfall Background", Config.snow, "enabled")
+	slider(sp, "Snow Amount", Config.snow, "amount", 0, 120, 5, setSnowAmount)
+	slider(sp, "Snow Speed", Config.snow, "speed", 0.2, 3, 0.1)
+	slider(sp, "Snow Size", Config.snow, "size", 0.5, 3, 0.1)
+
+	header(sp, "Actions")
+	actionButton(sp, "Stop All Script Loops", Color3.fromRGB(200, 160, 50), stopAllLoops)
+	actionButton(sp, "Reset All Settings", Color3.fromRGB(120, 120, 140), function()
+		for _, fn in ipairs(resetFns) do fn() end
+	end)
+
+	local function unload()
+		unloaded = true
+		for _, c in pairs(deathConns) do c:Disconnect() end
+		if Config.preset.autoSave and Storage.kind ~= "none" then
+			pcall(savePreset, Config.preset.name, true)
+		end
+		B.enabled = false
+		stopBotMovement(true)
+		hbRestoreAll()
+		stopAllLoops()
+		RunService:UnbindFromRenderStep("LSW_Main")
+		for _, c in ipairs(conns) do c:Disconnect() end
+		gui:Destroy()
+		overlay:Destroy()
+	end
+	actionButton(sp, "Unload GUI", OFF_COLOR, unload)
+	closeBtn.MouseButton1Click:Connect(unload)
+end
+
+---------------------------------------------------------------- Keybinds
+connect(UIS.InputBegan, function(input, gp)
+	if listening and input.UserInputType == Enum.UserInputType.Keyboard then
+		local cb = listening
+		listening = nil
+		cb(input.KeyCode)
+		return
+	end
+	if gp then return end
+	if input.KeyCode == Config.ui.toggleKey then
+		gui.Enabled = not gui.Enabled
+	elseif input.KeyCode == Config.ui.minKey then
+		if main.Visible then minimize() else restore() end
+	elseif input.KeyCode == B.toggleKey then
+		setBotEnabled(not B.enabled)
+	end
+end)
+
+---------------------------------------------------------------- Startup
+-- phase 2 of the preset load: rainbow flags + saved scripts (UI exists now)
+if startupData then
+	applyExtras(startupData)
+	refreshAllUi()
+end
+dirty = false
+
+selectTab("Scripts")
+
+--[[
+NOTES
+- v9.1 register fix: Luau allows 200 local variables per function and a script's top level counts as
+  one function. Sections are wrapped in do ... end so their helpers stop counting. When you add new
+  features, wrap them in do ... end too (only keep a local at the top level if another section needs it,
+  and use "local name" before the block + "function name()" inside it).
+
+- Fire Method:
+    LMB Spam       one clean click per shot (release -> press -> release), every Fire Delay but never
+                   faster than ~20/s, for as long as the bot stays locked on. Needs VirtualInputManager
+                   or mouse1press, otherwise only the BotFire attribute is set
+    LMB Hold       holds left mouse while on target, releases when the target is lost
+    Tool Activate  only tool:Activate() (left-click style)
+    Both           LMB spam + tool:Activate()
+  The click happens at your mouse position, so keep the GUI out from under the cursor
+  (minimize it with the Minimize Key) or the click lands on the GUI instead of the game.
+
+- Reading the status line while sniping: "sniping X | LMB spam (...) shot #N".
+    * N keeps going up but the gun doesn't fire  -> the game is ignoring the clicks (cooldown, or the
+      cursor is over the GUI). Try hooking BotFire (below).
+    * N stops going up while still locked        -> tell me, that would be a bug in the bot.
+
+- DeathFix (Bot tab + Aimbot tab toggles): EVERYONE who dies is handled, not just your kills.
+  Deaths come from the Killed remote (any killer/victim), Humanoid.Died, and a player's old Character
+  being replaced on respawn. The dead character is marked (bot/aimbot ignore it at once), that player's
+  ESP is deleted (nobody else's), and body models that show up with their name, or around the time and
+  place of the death, are marked too. A respawned player is a new model, so they work normally again.
+  A non-player lock whose health doesn't change for 4s is dropped as a stuck body.
+  If the remote can't be found you get a warning in the output.
+
+- Auto Spawn: does NOT spam. When the Killed remote says YOU died it waits "Delay After Death"
+  (0.5s) and presses the spawn key (Space). "Retry Until Respawned" presses again every
+  "Retry Interval" (max 6 times) until you get a new character.
+
+- NPC targeting / dead bodies: with "NPC Hitbox Part (required)" = Hitbox, an NPC is only a target
+  while it has a part with that name, and the instant that part is removed it is dropped (checked every
+  frame). Blank the field to target any NPC model.
+
+- Works in any game, but for YOUR game the most reliable hook is in your weapon's LocalScript:
+      tool:GetAttributeChangedSignal("BotFire"):Connect(shoot)
+  The bot sets the "BotFire" attribute on the tool every time it fires (and on your player).
+
+- Presets: Save writes everything (all settings, colors, rainbow flags, keybinds, script slots).
+  The preset you saved last loads automatically on start. bot.enabled is deliberately NOT stored,
+  so the bot never starts by itself.
+]]
